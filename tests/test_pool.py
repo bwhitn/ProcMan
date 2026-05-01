@@ -1,5 +1,6 @@
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from time import sleep, time
 
 from procman import PersistentProcPool, ProcPool
 
@@ -30,6 +31,9 @@ def test_persistent_pool_error_hook_runs() -> None:
         on_job_error=lambda args, error: errors.append((args, error)),
     ) as pool:
         pool.apply(_raise_error, [], callback=lambda args: callbacks.append(args))
+        deadline = time() + 5
+        while time() < deadline and not errors:
+            sleep(0.1)
     assert errors
     assert "boom" in errors[0][1]
     assert callbacks == [[]]
