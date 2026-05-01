@@ -1,0 +1,27 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "procman"
+version = "0.1.0"
+description = "Process supervision helpers with per-job memory and time limits."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [
+    { name = "bwhitn" }
+]
+dependencies = [
+    "psutil>=5.9",
+]
+
+[project.urls]
+Homepage = "https://github.com/bwhitn/procman"
+Source = "https://github.com/bwhitn/procman"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/procman"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
