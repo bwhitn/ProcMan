@@ -17,8 +17,8 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/bwhitn/procman"
-Source = "https://github.com/bwhitn/procman"
+Homepage = "https://github.com/bwhitn/ProcMan"
+Source = "https://github.com/bwhitn/ProcMan"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/procman"]
