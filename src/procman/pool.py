@@ -280,7 +280,7 @@ class PersistentProcPool:
             raise ValueError("Invalid number of processes")
         self._proc_limit = processes
         self._max_tasks = max_tasks_per_worker
-        self._job_queue: MPQueue = MPQueue()
+        self._job_queues: dict[int, MPQueue] = {}
         self._done_queue: MPQueue = MPQueue()
         self._workers: dict[int, Process] = {}
         self._running_jobs: dict[int, dict[str, Any]] = {}
@@ -303,9 +303,9 @@ class PersistentProcPool:
 
     def shutdown(self, force: bool = False) -> None:
         self.running = False
-        for _ in range(len(self._workers)):
+        for queue in self._job_queues.values():
             try:
-                self._job_queue.put_nowait(None)
+                queue.put_nowait(None)
             except Exception:
                 pass
         if force:
@@ -316,9 +316,13 @@ class PersistentProcPool:
                     pass
 
     def _spawn_worker(self, worker_id: int) -> None:
+        job_queue = self._job_queues.get(worker_id)
+        if job_queue is None:
+            job_queue = MPQueue()
+            self._job_queues[worker_id] = job_queue
         proc = Process(
             target=_worker_loop,
-            args=(worker_id, self._job_queue, self._done_queue, self._max_tasks),
+            args=(worker_id, job_queue, self._done_queue, self._max_tasks),
             daemon=True,
         )
         proc.start()
@@ -450,6 +454,6 @@ class PersistentProcPool:
                         "limit_mem": limit_mem,
                         "start": None,
                     }
-                    self._job_queue.put((job_id, target, list(norm_args)))
+                    self._job_queues[worker_id].put((job_id, target, list(norm_args)))
                     return
             sleep(0.1)

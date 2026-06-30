@@ -17,12 +17,16 @@ The package exports:
 
 - `ProcPool`
 - `PersistentProcPool`
+- `JobTracker`
+- logger hook helpers: `make_job_killed_hook()` and `make_job_error_hook()`
 
-Both support:
+`JobTracker` tracks submitted, cancelled, completed, and pending jobs. Its `done()` method is shaped to be passed directly as a pool callback.
+
+Both pools support:
 
 - `apply(target, args, limit_mem=0, limit_time=0, callback=None)`
 
-Pool constructors also accept optional hooks:
+Pool constructors also accept optional hooks. The hook helpers can build these hooks for logger-like objects passed in job args:
 
 - `on_job_killed(args, reason)`
 - `on_job_error(args, error)` for `PersistentProcPool`
