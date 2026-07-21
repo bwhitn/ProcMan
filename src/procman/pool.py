@@ -1,18 +1,29 @@
 from __future__ import annotations
 
 from inspect import signature
-from multiprocessing import Process, Queue as MPQueue
+from multiprocessing import Pipe, Process, Queue as MPQueue
 from queue import Empty, Queue
 from threading import Thread
-from time import sleep, time
+from time import monotonic, sleep
 from typing import Any, Callable, Iterable, Optional
 
-import psutil
+import psutil  # type: ignore[import-untyped]
+
+from procman._containment import (
+    ContainmentError,
+    WorkerContainment,
+    contained_rss,
+    terminate_containment,
+)
 
 JobArgs = list[Any]
 JobCallback = Callable[[JobArgs], None]
 JobKillHook = Callable[[JobArgs, str], None]
 JobErrorHook = Callable[[JobArgs, str], None]
+
+_WORKER_START_TIMEOUT = 10.0
+_MANAGER_INTERVAL = 0.25
+_DESCENDANT_ERROR = "Job left descendant processes running; they were terminated."
 
 
 def _normalize_args(args: Iterable[Any]) -> JobArgs:
@@ -59,6 +70,25 @@ def _safe_invoke_error_hook(hook: JobErrorHook | None, args: JobArgs, error: str
         print(traceback.format_exc())
 
 
+def _run_proc_job(target: Callable, args: JobArgs, startup) -> None:
+    try:
+        containment = WorkerContainment()
+        backend = containment.enter_job()
+    except BaseException as error:
+        try:
+            startup.send(("error", f"{type(error).__name__}: {error}"))
+        finally:
+            startup.close()
+        raise
+
+    startup.send(("ready", backend))
+    startup.close()
+    try:
+        target(*args)
+    finally:
+        containment.finish_job()
+
+
 class ProcPool:
     """Custom process pool with per-job time and memory limits."""
 
@@ -80,9 +110,12 @@ class ProcPool:
             self._pid = -1
             self._pool_id = uid
             self._start_time = -1
+            self._started_at = -1.0
             self._args = (target, _normalize_args(args))
             self._cb = callback
             self._kill_reason: str | None = None
+            self._process: Process | None = None
+            self._backend: str | None = None
 
         def get_psproc(self) -> psutil.Process | None:
             if not psutil.pid_exists(self._pid):
@@ -106,10 +139,35 @@ class ProcPool:
             run_args = list(job_args)
             if len(signature(target).parameters) > len(run_args):
                 run_args.append(self._pool_id)
-            proc = Process(target=target, args=run_args, daemon=True)
-            proc.start()
-            self._start_time = psutil.Process(proc.pid).create_time()
-            self._pid = proc.pid
+            startup, child_startup = Pipe(duplex=False)
+            proc = Process(
+                target=_run_proc_job,
+                args=(target, run_args, child_startup),
+                daemon=True,
+            )
+            try:
+                proc.start()
+                child_startup.close()
+                self._process = proc
+                if proc.pid is None:
+                    raise RuntimeError("worker started without a process ID")
+                self._pid = proc.pid
+                self._start_time = psutil.Process(self._pid).create_time()
+                if not startup.poll(_WORKER_START_TIMEOUT):
+                    raise RuntimeError("worker did not establish process containment")
+                status, detail = startup.recv()
+                if status != "ready":
+                    raise RuntimeError(f"worker containment setup failed: {detail}")
+                self._backend = str(detail)
+                self._started_at = monotonic()
+            except BaseException:
+                if proc.pid is not None:
+                    terminate_containment(proc.pid, self._backend)
+                proc.join(timeout=1)
+                raise
+            finally:
+                startup.close()
+                child_startup.close()
 
         def get_time_limit(self) -> int:
             return int(self._limit_time)
@@ -124,29 +182,40 @@ class ProcPool:
         def is_time_exceeded(self) -> bool:
             psproc = self.get_psproc()
             if psproc and psproc.is_running() and self._limit_time != 0:
-                return time() - psproc.create_time() > self._limit_time
+                return monotonic() - self._started_at > self._limit_time
             return False
 
         def is_mem_exceeded(self) -> bool:
             psproc = self.get_psproc()
             if psproc and self._pid > 0 and self._limit_mem != 0:
-                return self._limit_mem < (psproc.memory_info().rss / (1024 * 1024))
+                try:
+                    mem_mb = contained_rss(self._pid, self._backend or "") / (1024 * 1024)
+                except ContainmentError as error:
+                    print(f"Process {self._pid} containment accounting failed: {error}")
+                    return True
+                return self._limit_mem < mem_mb
             return False
 
         def is_alive(self) -> bool:
-            psproc = self.get_psproc()
-            if psproc:
-                return psproc.is_running()
-            return False
+            return self._process is not None and self._process.is_alive()
 
         def get_pool_pid(self) -> int:
             return self._pool_id
 
         def kill(self, reason: str) -> None:
-            psproc = self.get_psproc()
             self._kill_reason = reason
-            if psproc:
-                psproc.kill()
+            self.cleanup()
+
+        def cleanup(self) -> None:
+            if self._pid > 0:
+                remaining = terminate_containment(self._pid, self._backend)
+                if remaining:
+                    print(
+                        f"Process {self._pid} containment still has live processes: "
+                        f"{remaining}"
+                    )
+            if self._process is not None:
+                self._process.join(timeout=1)
 
         def status(self) -> str:
             psproc = self.get_psproc()
@@ -166,7 +235,7 @@ class ProcPool:
             raise ValueError("Invalid number of processes")
         self._ids = set(range(processes))
         self._proc_limit = processes
-        self._queue = Queue(processes)
+        self._queue: Queue[ProcPool.Proc] = Queue(processes)
         self._procs: dict[int, ProcPool.Proc] = {}
         self._on_job_killed = on_job_killed
         self.running = True
@@ -196,7 +265,7 @@ class ProcPool:
 
     def _thrd_mgr(self):
         while self.running or len(self._procs) > 0:
-            sleep(1)
+            sleep(_MANAGER_INTERVAL)
             remove_pids = []
             for pid, proc in self._procs.items():
                 if not proc.is_alive() or proc.status() in (psutil.STATUS_ZOMBIE, psutil.STATUS_DEAD):
@@ -212,6 +281,7 @@ class ProcPool:
                     continue
             for pid in remove_pids:
                 proc = self._procs.pop(pid)
+                proc.cleanup()
                 if proc.reason():
                     _safe_invoke_kill_hook(self._on_job_killed, proc.get_args(), proc.reason(), "ProcPool")
                 _safe_invoke_callback(proc.get_callback(), proc.get_args(), "ProcPool")
@@ -220,8 +290,17 @@ class ProcPool:
                 try:
                     proc = self._queue.get(timeout=1)
                     proc._pool_id = self._ids.pop()
-                    proc.start()
-                    self._procs[proc.pid] = proc
+                    try:
+                        proc.start()
+                    except Exception:
+                        self._ids.add(proc.get_pool_pid())
+                        print("ProcPool worker failed to start")
+                        import traceback
+
+                        print(traceback.format_exc())
+                        _safe_invoke_callback(proc.get_callback(), proc.get_args(), "ProcPool")
+                    else:
+                        self._procs[proc.pid] = proc
                 except Empty:
                     break
 
@@ -248,21 +327,85 @@ class ProcPool:
             self.apply(target=func, args=item, limit_mem=limit_mem, limit_time=limit_time, callback=callback)
 
 
-def _worker_loop(worker_id: int, job_queue: MPQueue, done_queue: MPQueue, max_tasks: int) -> None:
+def _worker_loop(
+    worker_id: int,
+    job_queue: MPQueue,
+    done_queue: MPQueue,
+    max_tasks: int,
+    startup,
+) -> None:
+    try:
+        containment = WorkerContainment()
+    except BaseException as error:
+        try:
+            startup.send(("error", f"{type(error).__name__}: {error}"))
+        finally:
+            startup.close()
+        raise
+
+    startup.send(("ready", containment.backend))
+    startup.close()
     tasks = 0
     while True:
         job = job_queue.get()
         if job is None:
             break
         job_id, target, args = job
-        done_queue.put(("start", worker_id, job_id, time()))
+        try:
+            backend = containment.enter_job()
+        except BaseException as error:
+            done_queue.put(
+                (
+                    "containment_error",
+                    worker_id,
+                    job_id,
+                    f"{type(error).__name__}: {error}",
+                )
+            )
+            raise
+        done_queue.put(
+            (
+                "start",
+                worker_id,
+                job_id,
+                {"started": monotonic(), "backend": backend},
+            )
+        )
         exc = None
+        fatal: BaseException | None = None
         try:
             target(*args)
         except Exception as err:  # noqa: BLE001
             exc = str(err)
-        done_queue.put(("done", worker_id, job_id, exc))
+        except BaseException as error:
+            fatal = error
+        descendants = False
+        cleanup_error = None
+        try:
+            descendants = containment.finish_job()
+        except BaseException as error:
+            cleanup_error = f"{type(error).__name__}: {error}"
+        if fatal is not None:
+            raise fatal
+        restart = cleanup_error is not None or (
+            descendants and containment.restart_after_descendants
+        )
+        done_queue.put(
+            (
+                "done",
+                worker_id,
+                job_id,
+                {
+                    "error": exc,
+                    "descendants": descendants,
+                    "cleanup_error": cleanup_error,
+                    "restart": restart,
+                },
+            )
+        )
         tasks += 1
+        if restart:
+            break
         if max_tasks and tasks >= max_tasks:
             done_queue.put(("exit", worker_id, None, None))
             break
@@ -292,8 +435,13 @@ class PersistentProcPool:
         self._mg_thrd = Thread(target=self._thrd_mgr, daemon=True)
 
     def __enter__(self):
-        for worker_id in range(self._proc_limit):
-            self._spawn_worker(worker_id)
+        try:
+            for worker_id in range(self._proc_limit):
+                self._spawn_worker(worker_id)
+        except BaseException:
+            for worker_id in list(self._workers):
+                self._terminate_worker(worker_id)
+            raise
         self._mg_thrd.start()
         return self
 
@@ -309,38 +457,72 @@ class PersistentProcPool:
             except Exception:
                 pass
         if force:
-            for proc in list(self._workers.values()):
-                try:
-                    psutil.Process(proc.pid).kill()
-                except Exception:
-                    pass
+            for worker_id in list(self._workers):
+                job_id = self._worker_jobs.get(worker_id)
+                job = self._running_jobs.get(job_id) if job_id is not None else None
+                backend = job.get("backend") if job else None
+                self._terminate_worker(worker_id, backend=backend)
 
     def _spawn_worker(self, worker_id: int) -> None:
         job_queue = self._job_queues.get(worker_id)
         if job_queue is None:
             job_queue = MPQueue()
             self._job_queues[worker_id] = job_queue
+        startup, child_startup = Pipe(duplex=False)
         proc = Process(
             target=_worker_loop,
-            args=(worker_id, job_queue, self._done_queue, self._max_tasks),
+            args=(
+                worker_id,
+                job_queue,
+                self._done_queue,
+                self._max_tasks,
+                child_startup,
+            ),
             daemon=True,
         )
-        proc.start()
+        try:
+            proc.start()
+            child_startup.close()
+            if not startup.poll(_WORKER_START_TIMEOUT):
+                raise RuntimeError("persistent worker did not establish containment")
+            status, detail = startup.recv()
+            if status != "ready":
+                raise RuntimeError(f"persistent worker containment setup failed: {detail}")
+        except BaseException:
+            if proc.pid is not None:
+                terminate_containment(proc.pid, None)
+            proc.join(timeout=1)
+            raise
+        finally:
+            startup.close()
+            child_startup.close()
         self._workers[worker_id] = proc
         self._worker_jobs[worker_id] = None
 
-    def _restart_worker(self, worker_id: int) -> None:
+    def _terminate_worker(self, worker_id: int, backend: str | None = None) -> None:
         proc = self._workers.get(worker_id)
         if proc is not None:
-            try:
-                psutil.Process(proc.pid).kill()
-            except Exception:
-                pass
-        self._spawn_worker(worker_id)
+            if proc.pid is None:
+                return
+            remaining = terminate_containment(proc.pid, backend)
+            if remaining:
+                print(
+                    f"PersistentProcPool worker {worker_id} containment still has "
+                    f"live processes: {remaining}"
+                )
+            proc.join(timeout=1)
+
+    def _restart_worker(self, worker_id: int, backend: str | None = None) -> None:
+        self._terminate_worker(worker_id, backend=backend)
+        if self.running:
+            self._spawn_worker(worker_id)
+        else:
+            self._workers.pop(worker_id, None)
+            self._worker_jobs[worker_id] = None
 
     def _thrd_mgr(self) -> None:
         while self.running or self._running_jobs:
-            now = time()
+            now = monotonic()
             while True:
                 try:
                     msg = self._done_queue.get_nowait()
@@ -350,15 +532,55 @@ class PersistentProcPool:
                 if action == "start":
                     job = self._running_jobs.get(job_id)
                     if job:
-                        job["start"] = payload
+                        job["start"] = payload["started"]
+                        job["backend"] = payload["backend"]
                 elif action == "done":
                     job = self._running_jobs.pop(job_id, None)
                     self._worker_jobs[worker_id] = None
-                    if payload and job:
-                        print(f"PersistentProcPool worker {worker_id} job {job_id} failed: {payload}")
-                        _safe_invoke_error_hook(self._on_job_error, job["args"], str(payload), "PersistentProcPool")
+                    if payload.get("restart"):
+                        backend = job.get("backend") if job else None
+                        self._restart_worker(worker_id, backend=backend)
+                    errors = []
+                    if payload.get("error"):
+                        errors.append(str(payload["error"]))
+                    if payload.get("descendants"):
+                        errors.append(_DESCENDANT_ERROR)
+                    if payload.get("cleanup_error"):
+                        errors.append(
+                            f"Process containment cleanup failed: "
+                            f"{payload['cleanup_error']}"
+                        )
+                    if errors and job:
+                        error = " ".join(errors)
+                        print(
+                            f"PersistentProcPool worker {worker_id} job "
+                            f"{job_id} failed: {error}"
+                        )
+                        _safe_invoke_error_hook(
+                            self._on_job_error,
+                            job["args"],
+                            error,
+                            "PersistentProcPool",
+                        )
                     if job and job.get("callback"):
                         _safe_invoke_callback(job["callback"], job["args"], "PersistentProcPool")
+                elif action == "containment_error":
+                    job = self._running_jobs.pop(job_id, None)
+                    self._worker_jobs[worker_id] = None
+                    self._restart_worker(worker_id)
+                    if job:
+                        _safe_invoke_error_hook(
+                            self._on_job_error,
+                            job["args"],
+                            f"Process containment setup failed: {payload}",
+                            "PersistentProcPool",
+                        )
+                        if job.get("callback"):
+                            _safe_invoke_callback(
+                                job["callback"],
+                                job["args"],
+                                "PersistentProcPool",
+                            )
                 elif action == "exit":
                     self._restart_worker(worker_id)
             for worker_id, job_id in list(self._worker_jobs.items()):
@@ -366,71 +588,86 @@ class PersistentProcPool:
                 if proc is None:
                     continue
                 if not proc.is_alive():
+                    job = None
+                    backend = None
                     if job_id is not None:
                         job = self._running_jobs.pop(job_id, None)
-                        if job:
-                            _safe_invoke_kill_hook(self._on_job_killed, job["args"], ProcPool.TIME, "PersistentProcPool")
-                            if job.get("callback"):
-                                _safe_invoke_callback(job["callback"], job["args"], "PersistentProcPool")
-                    self._restart_worker(worker_id)
+                        backend = job.get("backend") if job else None
+                    self._worker_jobs[worker_id] = None
+                    self._restart_worker(worker_id, backend=backend)
+                    if job:
+                        _safe_invoke_kill_hook(
+                            self._on_job_killed,
+                            job["args"],
+                            ProcPool.TIME,
+                            "PersistentProcPool",
+                        )
+                        if job.get("callback"):
+                            _safe_invoke_callback(
+                                job["callback"],
+                                job["args"],
+                                "PersistentProcPool",
+                            )
                     continue
                 if job_id is None:
                     continue
                 job = self._running_jobs.get(job_id)
                 if not job or not job.get("start"):
                     continue
-                try:
-                    psproc = psutil.Process(proc.pid)
-                except (psutil.Error, ProcessLookupError):
-                    if job_id is not None:
-                        job = self._running_jobs.pop(job_id, None)
-                        if job:
-                            _safe_invoke_kill_hook(self._on_job_killed, job["args"], ProcPool.TIME, "PersistentProcPool")
-                            if job.get("callback"):
-                                _safe_invoke_callback(job["callback"], job["args"], "PersistentProcPool")
-                    self._worker_jobs[worker_id] = None
-                    self._restart_worker(worker_id)
-                    continue
                 if job["limit_time"] and now - job["start"] > job["limit_time"]:
                     print(
                         f"PersistentProcPool worker {worker_id} job {job_id} exceeded the time limit of "
                         f"{job['limit_time']} seconds"
                     )
-                    _safe_invoke_kill_hook(self._on_job_killed, job["args"], ProcPool.TIME, "PersistentProcPool")
-                    try:
-                        psproc.kill()
-                    except Exception:
-                        pass
-                    if job.get("callback"):
-                        _safe_invoke_callback(job["callback"], job["args"], "PersistentProcPool")
                     self._running_jobs.pop(job_id, None)
                     self._worker_jobs[worker_id] = None
-                    self._restart_worker(worker_id)
+                    self._restart_worker(worker_id, backend=job["backend"])
+                    _safe_invoke_kill_hook(
+                        self._on_job_killed,
+                        job["args"],
+                        ProcPool.TIME,
+                        "PersistentProcPool",
+                    )
+                    if job.get("callback"):
+                        _safe_invoke_callback(
+                            job["callback"],
+                            job["args"],
+                            "PersistentProcPool",
+                        )
                     continue
                 if job["limit_mem"]:
-                    try:
-                        mem_mb = psproc.memory_info().rss / (1024 * 1024)
-                    except (psutil.Error, ProcessLookupError):
-                        self._worker_jobs[worker_id] = None
-                        self._restart_worker(worker_id)
+                    if proc.pid is None:
                         continue
+                    try:
+                        mem_mb = contained_rss(proc.pid, job["backend"]) / (1024 * 1024)
+                    except ContainmentError as error:
+                        print(
+                            f"PersistentProcPool worker {worker_id} job {job_id} "
+                            f"containment accounting failed: {error}"
+                        )
+                        mem_mb = float("inf")
                     if mem_mb > job["limit_mem"]:
                         print(
                             f"PersistentProcPool worker {worker_id} job {job_id} exceeded the memory limit of "
                             f"{job['limit_mem']}MB"
                         )
-                        _safe_invoke_kill_hook(self._on_job_killed, job["args"], ProcPool.MEM, "PersistentProcPool")
-                        try:
-                            psproc.kill()
-                        except Exception:
-                            pass
-                        if job.get("callback"):
-                            _safe_invoke_callback(job["callback"], job["args"], "PersistentProcPool")
                         self._running_jobs.pop(job_id, None)
                         self._worker_jobs[worker_id] = None
-                        self._restart_worker(worker_id)
+                        self._restart_worker(worker_id, backend=job["backend"])
+                        _safe_invoke_kill_hook(
+                            self._on_job_killed,
+                            job["args"],
+                            ProcPool.MEM,
+                            "PersistentProcPool",
+                        )
+                        if job.get("callback"):
+                            _safe_invoke_callback(
+                                job["callback"],
+                                job["args"],
+                                "PersistentProcPool",
+                            )
                         continue
-            sleep(0.5)
+            sleep(_MANAGER_INTERVAL)
 
     def apply(
         self,
