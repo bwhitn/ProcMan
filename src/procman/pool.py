@@ -5,7 +5,7 @@ import os
 from multiprocessing.context import BaseContext
 from queue import Empty, Queue
 from signal import Signals
-from threading import Thread
+from threading import Condition, Thread
 from time import monotonic, sleep
 from typing import Any, Callable, Iterable, Optional
 
@@ -488,6 +488,7 @@ class PersistentProcPool:
         self._start_ack_timeout = float(start_ack_timeout)
         self.running = True
         self._accepting = False
+        self._worker_condition = Condition()
         self._mg_thrd = Thread(target=self._thrd_mgr, daemon=True)
 
     @property
@@ -512,8 +513,10 @@ class PersistentProcPool:
         self._mg_thrd.join()
 
     def shutdown(self, force: bool = False) -> None:
-        self._accepting = False
-        self.running = False
+        with self._worker_condition:
+            self._accepting = False
+            self.running = False
+            self._worker_condition.notify_all()
         for queue in list(self._job_queues.values()):
             try:
                 queue.put(None)
@@ -568,7 +571,12 @@ class PersistentProcPool:
             startup.close()
             child_startup.close()
         self._workers[worker_id] = proc
-        self._worker_jobs[worker_id] = None
+        self._set_worker_idle(worker_id)
+
+    def _set_worker_idle(self, worker_id: int) -> None:
+        with self._worker_condition:
+            self._worker_jobs[worker_id] = None
+            self._worker_condition.notify_all()
 
     def _terminate_worker(self, worker_id: int, backend: str | None = None) -> None:
         proc = self._workers.get(worker_id)
@@ -596,16 +604,22 @@ class PersistentProcPool:
             self._spawn_worker(worker_id)
         else:
             self._workers.pop(worker_id, None)
-            self._worker_jobs[worker_id] = None
+            self._set_worker_idle(worker_id)
 
     def _thrd_mgr(self) -> None:
+        pending_message = None
+        next_worker_check = monotonic()
         while self.running or self._running_jobs:
             now = monotonic()
             while True:
-                try:
-                    msg = self._done_queue.get_nowait()
-                except Empty:
-                    break
+                if pending_message is not None:
+                    msg = pending_message
+                    pending_message = None
+                else:
+                    try:
+                        msg = self._done_queue.get_nowait()
+                    except Empty:
+                        break
                 action, worker_id, job_id, payload = msg
                 if action == "start":
                     job = self._running_jobs.get(job_id)
@@ -614,10 +628,11 @@ class PersistentProcPool:
                         job["backend"] = payload["backend"]
                 elif action == "done":
                     job = self._running_jobs.pop(job_id, None)
-                    self._worker_jobs[worker_id] = None
                     if payload.get("restart"):
                         backend = job.get("backend") if job else None
                         self._restart_worker(worker_id, backend=backend)
+                    else:
+                        self._set_worker_idle(worker_id)
                     errors = []
                     if payload.get("error"):
                         errors.append(str(payload["error"]))
@@ -644,7 +659,6 @@ class PersistentProcPool:
                         _safe_invoke_callback(job["callback"], job["args"], "PersistentProcPool")
                 elif action == "containment_error":
                     job = self._running_jobs.pop(job_id, None)
-                    self._worker_jobs[worker_id] = None
                     self._restart_worker(worker_id)
                     if job:
                         _safe_invoke_error_hook(
@@ -661,6 +675,15 @@ class PersistentProcPool:
                             )
                 elif action == "exit":
                     self._restart_worker(worker_id)
+            now = monotonic()
+            if now < next_worker_check:
+                try:
+                    pending_message = self._done_queue.get(
+                        timeout=next_worker_check - now,
+                    )
+                except Empty:
+                    pending_message = None
+                continue
             for worker_id, job_id in list(self._worker_jobs.items()):
                 proc = self._workers.get(worker_id)
                 if proc is None:
@@ -673,7 +696,6 @@ class PersistentProcPool:
                     if job_id is not None:
                         job = self._running_jobs.pop(job_id, None)
                         backend = job.get("backend") if job else None
-                    self._worker_jobs[worker_id] = None
                     replace_job_queue = bool(job and job.get("start") is None)
                     self._restart_worker(
                         worker_id,
@@ -712,7 +734,6 @@ class PersistentProcPool:
                     if submitted is None or now - submitted <= self._start_ack_timeout:
                         continue
                     self._running_jobs.pop(job_id, None)
-                    self._worker_jobs[worker_id] = None
                     self._restart_worker(worker_id, replace_job_queue=True)
                     error = (
                         f"Worker did not acknowledge job {job_id} within "
@@ -737,7 +758,6 @@ class PersistentProcPool:
                         f"{job['limit_time']} seconds"
                     )
                     self._running_jobs.pop(job_id, None)
-                    self._worker_jobs[worker_id] = None
                     self._restart_worker(worker_id, backend=job["backend"])
                     _safe_invoke_kill_hook(
                         self._on_job_killed,
@@ -769,7 +789,6 @@ class PersistentProcPool:
                             f"{job['limit_mem']}MB"
                         )
                         self._running_jobs.pop(job_id, None)
-                        self._worker_jobs[worker_id] = None
                         self._restart_worker(worker_id, backend=job["backend"])
                         _safe_invoke_kill_hook(
                             self._on_job_killed,
@@ -784,7 +803,13 @@ class PersistentProcPool:
                                 "PersistentProcPool",
                             )
                         continue
-            sleep(_MANAGER_INTERVAL)
+            next_worker_check = monotonic() + _MANAGER_INTERVAL
+            try:
+                pending_message = self._done_queue.get(
+                    timeout=max(0.0, next_worker_check - monotonic()),
+                )
+            except Empty:
+                pending_message = None
 
     def apply(
         self,
@@ -794,15 +819,22 @@ class PersistentProcPool:
         limit_time: int = 0,
         callback: JobCallback | None = None,
     ):
-        if not self._accepting:
-            raise RuntimeError("PersistentProcPool is not accepting jobs")
-        self._job_id += 1
-        job_id = self._job_id
         norm_args = _normalize_args(args)
-        while self._accepting:
-            for worker_id, current in self._worker_jobs.items():
-                if current is None:
-                    self._worker_jobs[worker_id] = job_id
+        with self._worker_condition:
+            if not self._accepting:
+                raise RuntimeError("PersistentProcPool is not accepting jobs")
+            self._job_id += 1
+            job_id = self._job_id
+            while self._accepting:
+                worker_id = next(
+                    (
+                        candidate
+                        for candidate, current in self._worker_jobs.items()
+                        if current is None
+                    ),
+                    None,
+                )
+                if worker_id is not None:
                     job: dict[str, Any] = {
                         "args": norm_args,
                         "callback": callback,
@@ -812,18 +844,21 @@ class PersistentProcPool:
                         "submitted": None,
                     }
                     self._running_jobs[job_id] = job
-                    try:
-                        self._job_queues[worker_id].put((job_id, target, norm_args))
-                    except Exception as error:
-                        self._running_jobs.pop(job_id, None)
-                        if self._worker_jobs.get(worker_id) == job_id:
-                            self._worker_jobs[worker_id] = None
-                        if isinstance(error, (EOFError, OSError, ValueError)):
-                            self._restart_worker(worker_id, replace_job_queue=True)
-                        raise JobSubmissionError(
-                            f"Unable to submit persistent job {job_id}"
-                        ) from error
-                    job["submitted"] = monotonic()
-                    return
-            sleep(0.1)
-        raise RuntimeError("PersistentProcPool is not accepting jobs")
+                    self._worker_jobs[worker_id] = job_id
+                    break
+                self._worker_condition.wait()
+            else:
+                raise RuntimeError("PersistentProcPool is not accepting jobs")
+
+        try:
+            self._job_queues[worker_id].put((job_id, target, norm_args))
+        except Exception as error:
+            self._running_jobs.pop(job_id, None)
+            if isinstance(error, (EOFError, OSError, ValueError)):
+                self._restart_worker(worker_id, replace_job_queue=True)
+            else:
+                self._set_worker_idle(worker_id)
+            raise JobSubmissionError(
+                f"Unable to submit persistent job {job_id}"
+            ) from error
+        job["submitted"] = monotonic()

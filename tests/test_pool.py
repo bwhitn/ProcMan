@@ -1,15 +1,15 @@
 import multiprocessing
 import os
-from pathlib import Path
 import signal
 import subprocess
 import sys
+from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Event, Lock, Thread
 from time import sleep, time
 
+import procman.pool as pool_module
 import pytest
-
 from procman import (
     JobSubmissionError,
     JobTracker,
@@ -18,7 +18,6 @@ from procman import (
     make_job_error_hook,
     make_job_killed_hook,
 )
-
 
 _DELAYED_MARKER_CODE = (
     "from pathlib import Path; "
@@ -402,6 +401,17 @@ def test_persistent_pool_error_hook_runs() -> None:
     assert errors
     assert "boom" in errors[0][1]
     assert callbacks == [[]]
+
+
+def test_persistent_pool_completion_wakes_manager(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(pool_module, "_MANAGER_INTERVAL", 1.0)
+    completed = Event()
+    with PersistentProcPool(1) as pool:
+        sleep(0.1)
+        pool.apply(_consume, [], callback=lambda _args: completed.set())
+        assert completed.wait(0.75)
 
 
 @pytest.mark.parametrize("exit_code", [0, 17])
