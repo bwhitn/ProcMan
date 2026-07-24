@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import multiprocessing
 import os
-from multiprocessing import Pipe, Process, Queue as MPQueue, SimpleQueue as MPSimpleQueue
+from multiprocessing.context import BaseContext
 from queue import Empty, Queue
 from signal import Signals
 from threading import Thread
@@ -30,6 +31,18 @@ _DESCENDANT_ERROR = "Job left descendant processes running; they were terminated
 
 class JobSubmissionError(RuntimeError):
     """A persistent job could not be serialized or sent to its worker."""
+
+
+def _resolve_mp_context(mp_context: BaseContext | str | None) -> BaseContext:
+    if mp_context is None:
+        methods = multiprocessing.get_all_start_methods()
+        method = "forkserver" if "forkserver" in methods else "spawn"
+        return multiprocessing.get_context(method)
+    if isinstance(mp_context, str):
+        return multiprocessing.get_context(mp_context)
+    if isinstance(mp_context, BaseContext):
+        return mp_context
+    raise TypeError("mp_context must be a multiprocessing context, start-method name, or None")
 
 
 def _normalize_args(args: Iterable[Any]) -> JobArgs:
@@ -128,6 +141,7 @@ class ProcPool:
             limit_time: int = 0,
             uid: int = -1,
             callback: JobCallback | None = None,
+            mp_context: BaseContext | None = None,
         ):
             self._limit_mem = limit_mem
             self._limit_time = limit_time
@@ -138,8 +152,9 @@ class ProcPool:
             self._args = (target, _normalize_args(args))
             self._cb = callback
             self._kill_reason: str | None = None
-            self._process: Process | None = None
+            self._process: Any | None = None
             self._backend: str | None = None
+            self._mp_context = mp_context or _resolve_mp_context(None)
 
         def get_psproc(self) -> psutil.Process | None:
             if not psutil.pid_exists(self._pid):
@@ -160,8 +175,8 @@ class ProcPool:
 
         def start(self) -> None:
             target, job_args = self._args
-            startup, child_startup = Pipe(duplex=False)
-            proc = Process(
+            startup, child_startup = self._mp_context.Pipe(duplex=False)
+            proc = self._mp_context.Process(  # type: ignore[attr-defined]
                 target=_run_proc_job,
                 args=(target, job_args, child_startup),
                 daemon=True,
@@ -184,7 +199,7 @@ class ProcPool:
             except BaseException:
                 if proc.pid is not None:
                     terminate_containment(proc.pid, self._backend)
-                proc.join(timeout=1)
+                    proc.join(timeout=1)
                 raise
             finally:
                 startup.close()
@@ -251,6 +266,7 @@ class ProcPool:
         self,
         processes: int = 1,
         on_job_killed: JobKillHook | None = None,
+        mp_context: BaseContext | str | None = None,
     ):
         if processes < 1:
             raise ValueError("Invalid number of processes")
@@ -259,8 +275,13 @@ class ProcPool:
         self._queue: Queue[ProcPool.Proc] = Queue(processes)
         self._procs: dict[int, ProcPool.Proc] = {}
         self._on_job_killed = on_job_killed
+        self._mp_context = _resolve_mp_context(mp_context)
         self.running = True
         self._mg_thrd = Thread(target=self._thrd_mgr, daemon=True)
+
+    @property
+    def start_method(self) -> str:
+        return self._mp_context.get_start_method()
 
     def __enter__(self):
         self._mg_thrd.start()
@@ -333,7 +354,14 @@ class ProcPool:
         limit_time: int = 0,
         callback: JobCallback | None = None,
     ):
-        proc = ProcPool.Proc(target=target, args=args, limit_mem=limit_mem, limit_time=limit_time, callback=callback)
+        proc = ProcPool.Proc(
+            target=target,
+            args=args,
+            limit_mem=limit_mem,
+            limit_time=limit_time,
+            callback=callback,
+            mp_context=self._mp_context,
+        )
         self._queue.put(proc)
 
     def map(
@@ -351,7 +379,7 @@ class ProcPool:
 def _worker_loop(
     worker_id: int,
     job_queue: Any,
-    done_queue: MPQueue,
+    done_queue: Any,
     max_tasks: int,
     startup,
 ) -> None:
@@ -440,6 +468,7 @@ class PersistentProcPool:
         on_job_killed: JobKillHook | None = None,
         on_job_error: JobErrorHook | None = None,
         start_ack_timeout: float = _JOB_START_ACK_TIMEOUT,
+        mp_context: BaseContext | str | None = None,
     ):
         if processes < 1:
             raise ValueError("Invalid number of processes")
@@ -447,9 +476,10 @@ class PersistentProcPool:
             raise ValueError("Invalid start acknowledgement timeout")
         self._proc_limit = processes
         self._max_tasks = max_tasks_per_worker
+        self._mp_context = _resolve_mp_context(mp_context)
         self._job_queues: dict[int, Any] = {}
-        self._done_queue: MPQueue = MPQueue()
-        self._workers: dict[int, Process] = {}
+        self._done_queue: Any = self._mp_context.Queue()
+        self._workers: dict[int, Any] = {}
         self._running_jobs: dict[int, dict[str, Any]] = {}
         self._worker_jobs: dict[int, Optional[int]] = {}
         self._job_id = 0
@@ -459,6 +489,10 @@ class PersistentProcPool:
         self.running = True
         self._accepting = False
         self._mg_thrd = Thread(target=self._thrd_mgr, daemon=True)
+
+    @property
+    def start_method(self) -> str:
+        return self._mp_context.get_start_method()
 
     def __enter__(self):
         try:
@@ -503,10 +537,10 @@ class PersistentProcPool:
     def _spawn_worker(self, worker_id: int) -> None:
         job_queue = self._job_queues.get(worker_id)
         if job_queue is None:
-            job_queue = MPSimpleQueue()
+            job_queue = self._mp_context.SimpleQueue()
             self._job_queues[worker_id] = job_queue
-        startup, child_startup = Pipe(duplex=False)
-        proc = Process(
+        startup, child_startup = self._mp_context.Pipe(duplex=False)
+        proc = self._mp_context.Process(  # type: ignore[attr-defined]
             target=_worker_loop,
             args=(
                 worker_id,
@@ -528,7 +562,7 @@ class PersistentProcPool:
         except BaseException:
             if proc.pid is not None:
                 terminate_containment(proc.pid, None)
-            proc.join(timeout=1)
+                proc.join(timeout=1)
             raise
         finally:
             startup.close()

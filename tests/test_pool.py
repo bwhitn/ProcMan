@@ -1,5 +1,5 @@
+import multiprocessing
 import os
-from multiprocessing import Manager
 from pathlib import Path
 import signal
 import subprocess
@@ -29,8 +29,12 @@ _DELAYED_MARKER_CODE = (
 _MEMORY_CHILD_CODE = (
     "from pathlib import Path; "
     "import sys, time; "
+    "Path(sys.argv[1]).write_text('ready', encoding='utf-8'); "
+    "release = Path(sys.argv[3]); "
+    "deadline = time.time() + 10; "
+    "\nwhile not release.exists() and time.time() < deadline:\n"
+    "    time.sleep(0.01)\n"
     "payload = bytearray(int(sys.argv[2]) * 1024 * 1024); "
-    "Path(sys.argv[1]).write_text(str(len(payload)), encoding='utf-8'); "
     "time.sleep(30)"
 )
 _GRANDCHILD_LAUNCHER_CODE = (
@@ -42,6 +46,7 @@ _GRANDCHILD_LAUNCHER_CODE = (
 _DESCENDANT_ERROR_MESSAGE = (
     "Job left descendant processes running; they were terminated."
 )
+_INHERITED_LOCK = Lock()
 
 
 def _touch_file(path: str) -> None:
@@ -62,6 +67,19 @@ def _write_keyword_only_argument(
 
 def _write_variadic_arguments(path: str, *values: object) -> None:
     Path(path).write_text(repr(values), encoding="utf-8")
+
+
+def _write_start_method(path: str) -> None:
+    Path(path).write_text(multiprocessing.get_start_method(), encoding="utf-8")
+
+
+def _try_inherited_lock(path: str) -> None:
+    acquired = _INHERITED_LOCK.acquire(timeout=0.5)
+    try:
+        Path(path).write_text(str(acquired), encoding="utf-8")
+    finally:
+        if acquired:
+            _INHERITED_LOCK.release()
 
 
 def _raise_error() -> None:
@@ -110,10 +128,14 @@ def _spawn_delayed_marker_and_return(marker: str) -> None:
     )
 
 
-def _spawn_memory_children_then_wait(ready_a: str, ready_b: str) -> None:
+def _spawn_memory_children_then_wait(
+    ready_a: str,
+    ready_b: str,
+    release: str,
+) -> None:
     for ready in (ready_a, ready_b):
         subprocess.Popen(
-            [sys.executable, "-c", _MEMORY_CHILD_CODE, ready, "64"],
+            [sys.executable, "-c", _MEMORY_CHILD_CODE, ready, "64", release],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -165,6 +187,83 @@ def test_proc_pool_callback_runs() -> None:
             pool.apply(_touch_file, [str(out_path)], callback=lambda args: callbacks.append(args))
         assert out_path.is_file()
     assert callbacks
+
+
+@pytest.mark.parametrize(
+    "pool_type",
+    [ProcPool, PersistentProcPool],
+    ids=["one-shot", "persistent"],
+)
+def test_pool_uses_safe_default_context(pool_type) -> None:
+    methods = multiprocessing.get_all_start_methods()
+    expected = "forkserver" if "forkserver" in methods else "spawn"
+    with pool_type(1) as pool:
+        assert pool.start_method == expected
+
+
+@pytest.mark.parametrize(
+    "start_method",
+    [
+        method
+        for method in ("spawn", "forkserver")
+        if method in multiprocessing.get_all_start_methods()
+    ],
+)
+@pytest.mark.parametrize(
+    "pool_type",
+    [ProcPool, PersistentProcPool],
+    ids=["one-shot", "persistent"],
+)
+def test_pool_uses_requested_start_method(pool_type, start_method: str) -> None:
+    completed = Event()
+    with TemporaryDirectory() as tmpdir:
+        output = Path(tmpdir).joinpath("start-method.txt")
+        with pool_type(1, mp_context=start_method) as pool:
+            assert pool.start_method == start_method
+            pool.apply(
+                _write_start_method,
+                [str(output)],
+                callback=lambda _args: completed.set(),
+            )
+            assert completed.wait(5)
+        assert output.read_text(encoding="utf-8") == start_method
+
+
+def test_pool_accepts_context_object_and_rejects_invalid_context() -> None:
+    context = multiprocessing.get_context("spawn")
+    with ProcPool(1, mp_context=context) as pool:
+        assert pool.start_method == "spawn"
+        assert pool._mp_context is context
+
+    if "fork" in multiprocessing.get_all_start_methods():
+        with ProcPool(1, mp_context="fork") as pool:
+            assert pool.start_method == "fork"
+
+    with pytest.raises(TypeError, match="mp_context"):
+        ProcPool(1, mp_context=object())
+
+
+def test_safe_default_does_not_inherit_parent_thread_lock() -> None:
+    held = Event()
+    release = Event()
+
+    def hold_lock() -> None:
+        with _INHERITED_LOCK:
+            held.set()
+            release.wait(8)
+
+    holder = Thread(target=hold_lock)
+    holder.start()
+    assert held.wait(2)
+    try:
+        with TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir).joinpath("lock-result.txt")
+            with ProcPool(1) as pool:
+                pool.apply(_try_inherited_lock, [str(output)])
+            assert output.read_text(encoding="utf-8") == "True"
+    finally:
+        release.set()
+        holder.join(timeout=2)
 
 
 @pytest.mark.parametrize(
@@ -250,15 +349,17 @@ def test_memory_limit_accounts_for_descendant_rss(pool_type) -> None:
     with TemporaryDirectory() as tmpdir:
         ready_a = Path(tmpdir).joinpath("memory-child-a.txt")
         ready_b = Path(tmpdir).joinpath("memory-child-b.txt")
+        release = Path(tmpdir).joinpath("allocate-memory")
         with _make_pool(pool_type, killed, reasons, errors) as pool:
             pool.apply(
                 _spawn_memory_children_then_wait,
-                [str(ready_a), str(ready_b)],
+                [str(ready_a), str(ready_b), str(release)],
                 limit_mem=110,
                 limit_time=10,
             )
             assert _wait_for(ready_a, 5)
             assert _wait_for(ready_b, 5)
+            release.write_text("go", encoding="utf-8")
             assert killed.wait(8)
     assert reasons == [ProcPool.MEM]
 
@@ -532,7 +633,7 @@ def _wait_for_queue_items(queue, count: int, timeout: float = 5.0) -> int:
 
 def test_persistent_pool_starts_jobs_on_all_worker_slots() -> None:
     callbacks: list[list[object]] = []
-    with Manager() as manager:
+    with multiprocessing.Manager() as manager:
         started = manager.Queue()
         release = manager.Event()
         with PersistentProcPool(4) as pool:

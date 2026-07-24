@@ -28,6 +28,12 @@ Both pools support:
 
 - `apply(target, args, limit_mem=0, limit_time=0, callback=None)`
 
+Both constructors accept `mp_context`, either a multiprocessing context object
+or a start-method name. By default ProcMan uses `forkserver` when the platform
+supports it and `spawn` otherwise. The selected value is exposed through the
+pool's `start_method` property. ProcMan never changes the process-global start
+method.
+
 `PersistentProcPool` serializes each job synchronously before `apply()`
 returns. An unserializable target or argument raises `JobSubmissionError`
 without consuming a worker slot. Its constructor accepts
@@ -51,6 +57,12 @@ Pool constructors also accept optional hooks. The hook helpers can build these h
   descendants.
 - `limit_time` is measured in seconds.
 - callbacks and hooks run in the parent process.
+- `forkserver` and `spawn` require targets and arguments to be pickleable.
+  Callers may explicitly request `mp_context="fork"` on supporting POSIX
+  systems, but doing so from a multithreaded application can deadlock and is
+  not recommended.
+- Multiprocessing queues, locks, and other synchronization objects supplied in
+  job arguments must be compatible with the pool's selected context.
 - An abnormal persistent-worker exit reports its exit code or POSIX signal to
   the error hook, replaces the worker, and then invokes the completion callback.
 - limit and completion callbacks run only after ProcMan has terminated the
