@@ -156,8 +156,9 @@ def terminate_containment(
         if pgid == root_pid and pgid != os.getpgrp():
             backend = POSIX_PROCESS_GROUP
     if backend == POSIX_PROCESS_GROUP:
-        _, remaining = _terminate_posix_group(root_pid, timeout=timeout)
-        return remaining
+        _, group_remaining = _terminate_posix_group(root_pid, timeout=timeout)
+        tree_remaining = _terminate_process_tree(root_pid, timeout=timeout)
+        return sorted(set(group_remaining).union(tree_remaining))
     return _terminate_process_tree(root_pid, timeout=timeout)
 
 

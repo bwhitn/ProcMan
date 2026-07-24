@@ -380,6 +380,7 @@ def _worker_loop(
     worker_id: int,
     job_queue: Any,
     done_queue: Any,
+    finishing_event: Any,
     max_tasks: int,
     startup,
 ) -> None:
@@ -400,6 +401,7 @@ def _worker_loop(
         if job is None:
             break
         job_id, target, args = job
+        finishing_event.clear()
         try:
             backend = containment.enter_job()
         except BaseException as error:
@@ -430,6 +432,10 @@ def _worker_loop(
             fatal = error
         descendants = False
         cleanup_error = None
+        # Publish this synchronously before leaving the containment unit. The
+        # manager's completion queue is asynchronous, so it cannot by itself
+        # close the accounting race around finish_job().
+        finishing_event.set()
         try:
             descendants = containment.finish_job()
         except BaseException as error:
@@ -480,6 +486,7 @@ class PersistentProcPool:
         self._job_queues: dict[int, Any] = {}
         self._done_queue: Any = self._mp_context.Queue()
         self._workers: dict[int, Any] = {}
+        self._finishing_events: dict[int, Any] = {}
         self._running_jobs: dict[int, dict[str, Any]] = {}
         self._worker_jobs: dict[int, Optional[int]] = {}
         self._job_id = 0
@@ -542,6 +549,8 @@ class PersistentProcPool:
         if job_queue is None:
             job_queue = self._mp_context.SimpleQueue()
             self._job_queues[worker_id] = job_queue
+        finishing_event = self._mp_context.Event()
+        self._finishing_events[worker_id] = finishing_event
         startup, child_startup = self._mp_context.Pipe(duplex=False)
         proc = self._mp_context.Process(  # type: ignore[attr-defined]
             target=_worker_loop,
@@ -549,6 +558,7 @@ class PersistentProcPool:
                 worker_id,
                 job_queue,
                 self._done_queue,
+                finishing_event,
                 self._max_tasks,
                 child_startup,
             ),
@@ -628,6 +638,9 @@ class PersistentProcPool:
                         job["backend"] = payload["backend"]
                 elif action == "done":
                     job = self._running_jobs.pop(job_id, None)
+                    finishing_event = self._finishing_events.get(worker_id)
+                    if finishing_event is not None:
+                        finishing_event.clear()
                     if payload.get("restart"):
                         backend = job.get("backend") if job else None
                         self._restart_worker(worker_id, backend=backend)
@@ -729,6 +742,9 @@ class PersistentProcPool:
                 job = self._running_jobs.get(job_id)
                 if not job:
                     continue
+                finishing_event = self._finishing_events.get(worker_id)
+                if finishing_event is not None and finishing_event.is_set():
+                    continue
                 if job.get("start") is None:
                     submitted = job.get("submitted")
                     if submitted is None or now - submitted <= self._start_ack_timeout:
@@ -778,6 +794,8 @@ class PersistentProcPool:
                     try:
                         mem_mb = contained_rss(proc.pid, job["backend"]) / (1024 * 1024)
                     except ContainmentError as error:
+                        if finishing_event is not None and finishing_event.is_set():
+                            continue
                         print(
                             f"PersistentProcPool worker {worker_id} job {job_id} "
                             f"containment accounting failed: {error}"

@@ -18,6 +18,7 @@ from procman import (
     make_job_error_hook,
     make_job_killed_hook,
 )
+from procman._containment import POSIX_PROCESS_GROUP, terminate_containment
 
 _DELAYED_MARKER_CODE = (
     "from pathlib import Path; "
@@ -105,6 +106,13 @@ def _consume(*_values) -> None:
 def _mark_started_then_wait(path: str) -> None:
     Path(path).write_text("started", encoding="utf-8")
     sleep(30)
+
+
+def _mark_started_then_wait_for_release(started: str, release: str) -> None:
+    Path(started).write_text("started", encoding="utf-8")
+    deadline = time() + 10
+    while not Path(release).exists() and time() < deadline:
+        sleep(0.01)
 
 
 def _spawn_delayed_marker_then_wait(marker: str, pid_file: str) -> None:
@@ -387,6 +395,28 @@ def test_time_limit_terminates_reparented_grandchild(pool_type) -> None:
     assert reasons == [ProcPool.TIME]
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process groups only")
+def test_process_group_termination_also_terminates_root_outside_group() -> None:
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        assert os.getpgid(child.pid) != child.pid
+        assert terminate_containment(
+            child.pid,
+            POSIX_PROCESS_GROUP,
+            timeout=1,
+        ) == []
+        assert child.wait(timeout=2) != 0
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=2)
+
+
 def test_persistent_pool_error_hook_runs() -> None:
     errors: list[tuple[list[object], str]] = []
     callbacks: list[list[object]] = []
@@ -412,6 +442,47 @@ def test_persistent_pool_completion_wakes_manager(
         sleep(0.1)
         pool.apply(_consume, [], callback=lambda _args: completed.set())
         assert completed.wait(0.75)
+
+
+def test_persistent_pool_does_not_report_memory_failure_while_job_finishes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(pool_module, "_MANAGER_INTERVAL", 0.01)
+    accounting_started = Event()
+    completed = Event()
+    kill_reasons: list[str] = []
+    errors: list[str] = []
+    pool_ref: list[PersistentProcPool] = []
+
+    def accounting_during_finish(_pid: int, _backend: str) -> int:
+        accounting_started.set()
+        assert pool_ref[0]._finishing_events[0].wait(5)
+        raise pool_module.ContainmentError("forced finish handoff")
+
+    monkeypatch.setattr(pool_module, "contained_rss", accounting_during_finish)
+    with TemporaryDirectory() as tmpdir:
+        started = Path(tmpdir).joinpath("started.txt")
+        release = Path(tmpdir).joinpath("release.txt")
+        with PersistentProcPool(
+            1,
+            on_job_killed=lambda _args, reason: kill_reasons.append(reason),
+            on_job_error=lambda _args, error: errors.append(error),
+        ) as pool:
+            pool_ref.append(pool)
+            pool.apply(
+                _mark_started_then_wait_for_release,
+                [str(started), str(release)],
+                limit_mem=1,
+                callback=lambda _args: completed.set(),
+            )
+            assert _wait_for(started, 5)
+            assert accounting_started.wait(5)
+            release.write_text("go", encoding="utf-8")
+            assert completed.wait(5)
+            assert not pool._finishing_events[0].is_set()
+
+    assert kill_reasons == []
+    assert errors == []
 
 
 @pytest.mark.parametrize("exit_code", [0, 17])
