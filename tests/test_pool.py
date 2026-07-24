@@ -3,12 +3,19 @@ from pathlib import Path
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
-from threading import Event
+from threading import Event, Lock, Thread
 from time import sleep, time
 
 import pytest
 
-from procman import JobTracker, PersistentProcPool, ProcPool, make_job_error_hook, make_job_killed_hook
+from procman import (
+    JobSubmissionError,
+    JobTracker,
+    PersistentProcPool,
+    ProcPool,
+    make_job_error_hook,
+    make_job_killed_hook,
+)
 
 
 _DELAYED_MARKER_CODE = (
@@ -39,8 +46,33 @@ def _touch_file(path: str) -> None:
     Path(path).write_text("ok", encoding="utf-8")
 
 
+def _write_optional_argument(path: str, option: str = "expected-default") -> None:
+    Path(path).write_text(option, encoding="utf-8")
+
+
+def _write_keyword_only_argument(
+    path: str,
+    *,
+    option: str = "expected-keyword-only",
+) -> None:
+    Path(path).write_text(option, encoding="utf-8")
+
+
+def _write_variadic_arguments(path: str, *values: object) -> None:
+    Path(path).write_text(repr(values), encoding="utf-8")
+
+
 def _raise_error() -> None:
     raise RuntimeError("boom")
+
+
+class _ExplodingReduce:
+    def __reduce__(self):
+        raise RuntimeError("intentional reducer failure")
+
+
+def _consume(*_values) -> None:
+    return None
 
 
 def _mark_started_then_wait(path: str) -> None:
@@ -123,6 +155,24 @@ def test_proc_pool_callback_runs() -> None:
             pool.apply(_touch_file, [str(out_path)], callback=lambda args: callbacks.append(args))
         assert out_path.is_file()
     assert callbacks
+
+
+@pytest.mark.parametrize(
+    ("target", "args", "expected"),
+    [
+        (_write_optional_argument, [], "expected-default"),
+        (_write_optional_argument, ["explicit"], "explicit"),
+        (_write_keyword_only_argument, [], "expected-keyword-only"),
+        (_write_variadic_arguments, [], "()"),
+    ],
+    ids=["optional-default", "explicit-value", "keyword-only", "variadic"],
+)
+def test_proc_pool_preserves_target_arguments(target, args, expected: str) -> None:
+    with TemporaryDirectory() as tmpdir:
+        out_path = Path(tmpdir).joinpath("arguments.txt")
+        with ProcPool(1) as pool:
+            pool.apply(target, [str(out_path), *args])
+        assert out_path.read_text(encoding="utf-8") == expected
 
 
 @pytest.mark.parametrize(
@@ -241,6 +291,117 @@ def test_persistent_pool_error_hook_runs() -> None:
     assert errors
     assert "boom" in errors[0][1]
     assert callbacks == [[]]
+
+
+@pytest.mark.parametrize("case", ["argument", "target", "reducer"])
+def test_persistent_pool_rejects_unpickleable_job_without_losing_slot(
+    case: str,
+) -> None:
+    errors: list[str] = []
+    completed = Event()
+    with PersistentProcPool(
+        1,
+        on_job_error=lambda _args, error: errors.append(error),
+    ) as pool:
+        target = _consume
+        args = []
+        if case == "argument":
+            args = [Lock()]
+        elif case == "target":
+            def local_target() -> None:
+                return None
+
+            target = local_target
+        else:
+            args = [_ExplodingReduce()]
+
+        with pytest.raises(JobSubmissionError) as raised:
+            pool.apply(target, args)
+
+        assert raised.value.__cause__ is not None
+        assert pool._worker_jobs == {0: None}
+        assert pool._running_jobs == {}
+        assert errors == []
+
+        pool.apply(_consume, ["valid"], callback=lambda _args: completed.set())
+        assert completed.wait(5)
+
+
+class _DroppingQueue:
+    def __init__(self, queue) -> None:
+        self._queue = queue
+
+    def put(self, _item) -> None:
+        return None
+
+    def close(self) -> None:
+        self._queue.close()
+
+
+def test_persistent_pool_recovers_when_worker_does_not_acknowledge_job() -> None:
+    errors: list[str] = []
+    timed_out = Event()
+    completed = Event()
+    with TemporaryDirectory() as tmpdir:
+        dropped_path = Path(tmpdir).joinpath("dropped.txt")
+        valid_path = Path(tmpdir).joinpath("valid.txt")
+        with PersistentProcPool(
+            1,
+            on_job_error=lambda _args, error: errors.append(error),
+            start_ack_timeout=0.1,
+        ) as pool:
+            pool._job_queues[0] = _DroppingQueue(pool._job_queues[0])
+            pool.apply(
+                _touch_file,
+                [str(dropped_path)],
+                callback=lambda _args: timed_out.set(),
+            )
+
+            assert timed_out.wait(5)
+            assert not dropped_path.exists()
+            assert errors and "did not acknowledge" in errors[0]
+            assert pool._worker_jobs == {0: None}
+            assert pool._running_jobs == {}
+
+            pool.apply(
+                _touch_file,
+                [str(valid_path)],
+                callback=lambda _args: completed.set(),
+            )
+            assert completed.wait(5)
+            assert valid_path.read_text(encoding="utf-8") == "ok"
+
+
+def test_waiting_persistent_apply_stops_when_pool_shuts_down() -> None:
+    errors: list[BaseException] = []
+    with TemporaryDirectory() as tmpdir:
+        started = Path(tmpdir).joinpath("started.txt")
+        pool = PersistentProcPool(1)
+        pool.__enter__()
+        try:
+            pool.apply(_mark_started_then_wait, [str(started)])
+            assert _wait_for(started, 5)
+
+            def submit_waiting_job() -> None:
+                try:
+                    pool.apply(_consume, [])
+                except BaseException as error:
+                    errors.append(error)
+
+            submitter = Thread(target=submit_waiting_job)
+            submitter.start()
+            sleep(0.25)
+            assert submitter.is_alive()
+
+            pool.shutdown(force=True)
+            submitter.join(timeout=2)
+            assert not submitter.is_alive()
+            assert len(errors) == 1
+            assert isinstance(errors[0], RuntimeError)
+        finally:
+            pool.shutdown(force=True)
+            pool._mg_thrd.join(timeout=5)
+            assert not pool._mg_thrd.is_alive()
 
 
 def test_persistent_shutdown_does_not_restart_active_worker() -> None:

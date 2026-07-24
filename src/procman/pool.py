@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-from inspect import signature
-from multiprocessing import Pipe, Process, Queue as MPQueue
+from multiprocessing import Pipe, Process, Queue as MPQueue, SimpleQueue as MPSimpleQueue
 from queue import Empty, Queue
 from threading import Thread
 from time import monotonic, sleep
@@ -22,8 +21,13 @@ JobKillHook = Callable[[JobArgs, str], None]
 JobErrorHook = Callable[[JobArgs, str], None]
 
 _WORKER_START_TIMEOUT = 10.0
+_JOB_START_ACK_TIMEOUT = 10.0
 _MANAGER_INTERVAL = 0.25
 _DESCENDANT_ERROR = "Job left descendant processes running; they were terminated."
+
+
+class JobSubmissionError(RuntimeError):
+    """A persistent job could not be serialized or sent to its worker."""
 
 
 def _normalize_args(args: Iterable[Any]) -> JobArgs:
@@ -136,13 +140,10 @@ class ProcPool:
 
         def start(self) -> None:
             target, job_args = self._args
-            run_args = list(job_args)
-            if len(signature(target).parameters) > len(run_args):
-                run_args.append(self._pool_id)
             startup, child_startup = Pipe(duplex=False)
             proc = Process(
                 target=_run_proc_job,
-                args=(target, run_args, child_startup),
+                args=(target, job_args, child_startup),
                 daemon=True,
             )
             try:
@@ -329,7 +330,7 @@ class ProcPool:
 
 def _worker_loop(
     worker_id: int,
-    job_queue: MPQueue,
+    job_queue: Any,
     done_queue: MPQueue,
     max_tasks: int,
     startup,
@@ -418,12 +419,15 @@ class PersistentProcPool:
         max_tasks_per_worker: int = 0,
         on_job_killed: JobKillHook | None = None,
         on_job_error: JobErrorHook | None = None,
+        start_ack_timeout: float = _JOB_START_ACK_TIMEOUT,
     ):
         if processes < 1:
             raise ValueError("Invalid number of processes")
+        if start_ack_timeout <= 0:
+            raise ValueError("Invalid start acknowledgement timeout")
         self._proc_limit = processes
         self._max_tasks = max_tasks_per_worker
-        self._job_queues: dict[int, MPQueue] = {}
+        self._job_queues: dict[int, Any] = {}
         self._done_queue: MPQueue = MPQueue()
         self._workers: dict[int, Process] = {}
         self._running_jobs: dict[int, dict[str, Any]] = {}
@@ -431,7 +435,9 @@ class PersistentProcPool:
         self._job_id = 0
         self._on_job_killed = on_job_killed
         self._on_job_error = on_job_error
+        self._start_ack_timeout = float(start_ack_timeout)
         self.running = True
+        self._accepting = False
         self._mg_thrd = Thread(target=self._thrd_mgr, daemon=True)
 
     def __enter__(self):
@@ -439,10 +445,12 @@ class PersistentProcPool:
             for worker_id in range(self._proc_limit):
                 self._spawn_worker(worker_id)
         except BaseException:
+            self.running = False
             for worker_id in list(self._workers):
                 self._terminate_worker(worker_id)
             raise
         self._mg_thrd.start()
+        self._accepting = True
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -450,10 +458,11 @@ class PersistentProcPool:
         self._mg_thrd.join()
 
     def shutdown(self, force: bool = False) -> None:
+        self._accepting = False
         self.running = False
-        for queue in self._job_queues.values():
+        for queue in list(self._job_queues.values()):
             try:
-                queue.put_nowait(None)
+                queue.put(None)
             except Exception:
                 pass
         if force:
@@ -463,10 +472,18 @@ class PersistentProcPool:
                 backend = job.get("backend") if job else None
                 self._terminate_worker(worker_id, backend=backend)
 
+    def _discard_job_queue(self, worker_id: int) -> None:
+        queue = self._job_queues.pop(worker_id, None)
+        if queue is not None:
+            try:
+                queue.close()
+            except Exception:
+                pass
+
     def _spawn_worker(self, worker_id: int) -> None:
         job_queue = self._job_queues.get(worker_id)
         if job_queue is None:
-            job_queue = MPQueue()
+            job_queue = MPSimpleQueue()
             self._job_queues[worker_id] = job_queue
         startup, child_startup = Pipe(duplex=False)
         proc = Process(
@@ -512,8 +529,15 @@ class PersistentProcPool:
                 )
             proc.join(timeout=1)
 
-    def _restart_worker(self, worker_id: int, backend: str | None = None) -> None:
+    def _restart_worker(
+        self,
+        worker_id: int,
+        backend: str | None = None,
+        replace_job_queue: bool = False,
+    ) -> None:
         self._terminate_worker(worker_id, backend=backend)
+        if replace_job_queue:
+            self._discard_job_queue(worker_id)
         if self.running:
             self._spawn_worker(worker_id)
         else:
@@ -594,7 +618,12 @@ class PersistentProcPool:
                         job = self._running_jobs.pop(job_id, None)
                         backend = job.get("backend") if job else None
                     self._worker_jobs[worker_id] = None
-                    self._restart_worker(worker_id, backend=backend)
+                    replace_job_queue = bool(job and job.get("start") is None)
+                    self._restart_worker(
+                        worker_id,
+                        backend=backend,
+                        replace_job_queue=replace_job_queue,
+                    )
                     if job:
                         _safe_invoke_kill_hook(
                             self._on_job_killed,
@@ -612,7 +641,31 @@ class PersistentProcPool:
                 if job_id is None:
                     continue
                 job = self._running_jobs.get(job_id)
-                if not job or not job.get("start"):
+                if not job:
+                    continue
+                if job.get("start") is None:
+                    submitted = job.get("submitted")
+                    if submitted is None or now - submitted <= self._start_ack_timeout:
+                        continue
+                    self._running_jobs.pop(job_id, None)
+                    self._worker_jobs[worker_id] = None
+                    self._restart_worker(worker_id, replace_job_queue=True)
+                    error = (
+                        f"Worker did not acknowledge job {job_id} within "
+                        f"{self._start_ack_timeout:g} seconds"
+                    )
+                    _safe_invoke_error_hook(
+                        self._on_job_error,
+                        job["args"],
+                        error,
+                        "PersistentProcPool",
+                    )
+                    if job.get("callback"):
+                        _safe_invoke_callback(
+                            job["callback"],
+                            job["args"],
+                            "PersistentProcPool",
+                        )
                     continue
                 if job["limit_time"] and now - job["start"] > job["limit_time"]:
                     print(
@@ -677,20 +730,36 @@ class PersistentProcPool:
         limit_time: int = 0,
         callback: JobCallback | None = None,
     ):
+        if not self._accepting:
+            raise RuntimeError("PersistentProcPool is not accepting jobs")
         self._job_id += 1
         job_id = self._job_id
         norm_args = _normalize_args(args)
-        while True:
+        while self._accepting:
             for worker_id, current in self._worker_jobs.items():
                 if current is None:
                     self._worker_jobs[worker_id] = job_id
-                    self._running_jobs[job_id] = {
+                    job: dict[str, Any] = {
                         "args": norm_args,
                         "callback": callback,
                         "limit_time": limit_time,
                         "limit_mem": limit_mem,
                         "start": None,
+                        "submitted": None,
                     }
-                    self._job_queues[worker_id].put((job_id, target, list(norm_args)))
+                    self._running_jobs[job_id] = job
+                    try:
+                        self._job_queues[worker_id].put((job_id, target, norm_args))
+                    except Exception as error:
+                        self._running_jobs.pop(job_id, None)
+                        if self._worker_jobs.get(worker_id) == job_id:
+                            self._worker_jobs[worker_id] = None
+                        if isinstance(error, (EOFError, OSError, ValueError)):
+                            self._restart_worker(worker_id, replace_job_queue=True)
+                        raise JobSubmissionError(
+                            f"Unable to submit persistent job {job_id}"
+                        ) from error
+                    job["submitted"] = monotonic()
                     return
             sleep(0.1)
+        raise RuntimeError("PersistentProcPool is not accepting jobs")

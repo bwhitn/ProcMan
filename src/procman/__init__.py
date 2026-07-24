@@ -9,11 +9,12 @@ from procman.hooks import (
     make_job_error_hook,
     make_job_killed_hook,
 )
-from procman.pool import PersistentProcPool, ProcPool
+from procman.pool import JobSubmissionError, PersistentProcPool, ProcPool
 from procman.tracker import JobTracker
 
 __all__ = [
     "JobTracker",
+    "JobSubmissionError",
     "PersistentProcPool",
     "ProcPool",
     "find_analyzer_group",

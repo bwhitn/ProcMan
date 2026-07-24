@@ -18,6 +18,7 @@ The package exports:
 
 - `ProcPool`
 - `PersistentProcPool`
+- `JobSubmissionError`
 - `JobTracker`
 - logger hook helpers: `make_job_killed_hook()` and `make_job_error_hook()`
 
@@ -26,6 +27,12 @@ The package exports:
 Both pools support:
 
 - `apply(target, args, limit_mem=0, limit_time=0, callback=None)`
+
+`PersistentProcPool` serializes each job synchronously before `apply()`
+returns. An unserializable target or argument raises `JobSubmissionError`
+without consuming a worker slot. Its constructor accepts
+`start_ack_timeout=10.0` to control how long an accepted submission may wait
+for its worker to acknowledge the job before that worker is replaced.
 
 Pool constructors also accept optional hooks. The hook helpers can build these hooks for logger-like objects passed in job args:
 
