@@ -1,5 +1,7 @@
+import os
 from multiprocessing import Manager
 from pathlib import Path
+import signal
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
@@ -64,6 +66,14 @@ def _write_variadic_arguments(path: str, *values: object) -> None:
 
 def _raise_error() -> None:
     raise RuntimeError("boom")
+
+
+def _exit_worker(exit_code: int) -> None:
+    os._exit(exit_code)
+
+
+def _signal_worker(signal_number: int) -> None:
+    os.kill(os.getpid(), signal_number)
 
 
 class _ExplodingReduce:
@@ -291,6 +301,94 @@ def test_persistent_pool_error_hook_runs() -> None:
     assert errors
     assert "boom" in errors[0][1]
     assert callbacks == [[]]
+
+
+@pytest.mark.parametrize("exit_code", [0, 17])
+def test_persistent_pool_reports_abnormal_exit_and_recovers(
+    exit_code: int,
+) -> None:
+    errors: list[tuple[list[object], str]] = []
+    kill_reasons: list[str] = []
+    crashed = Event()
+    recovered = Event()
+    with TemporaryDirectory() as tmpdir:
+        output = Path(tmpdir).joinpath("recovered.txt")
+        with PersistentProcPool(
+            1,
+            on_job_killed=lambda _args, reason: kill_reasons.append(reason),
+            on_job_error=lambda args, error: errors.append((args, error)),
+        ) as pool:
+            pool.apply(
+                _exit_worker,
+                [exit_code],
+                callback=lambda _args: crashed.set(),
+            )
+            assert crashed.wait(5)
+            assert kill_reasons == []
+            assert errors == [
+                ([exit_code], f"Worker process exited unexpectedly with exit code {exit_code}")
+            ]
+
+            pool.apply(
+                _touch_file,
+                [str(output)],
+                callback=lambda _args: recovered.set(),
+            )
+            assert recovered.wait(5)
+            assert output.read_text(encoding="utf-8") == "ok"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX signal exit codes only")
+def test_persistent_pool_reports_worker_signal() -> None:
+    errors: list[str] = []
+    kill_reasons: list[str] = []
+    completed = Event()
+    with PersistentProcPool(
+        1,
+        on_job_killed=lambda _args, reason: kill_reasons.append(reason),
+        on_job_error=lambda _args, error: errors.append(error),
+    ) as pool:
+        pool.apply(
+            _signal_worker,
+            [signal.SIGTERM],
+            callback=lambda _args: completed.set(),
+        )
+        assert completed.wait(5)
+
+    assert kill_reasons == []
+    assert errors == [
+        f"Worker process exited unexpectedly after signal {signal.SIGTERM} (SIGTERM)"
+    ]
+
+
+def test_persistent_pool_reports_forced_shutdown_without_false_timeout() -> None:
+    errors: list[str] = []
+    kill_reasons: list[str] = []
+    completed = Event()
+    with TemporaryDirectory() as tmpdir:
+        started = Path(tmpdir).joinpath("started.txt")
+        pool = PersistentProcPool(
+            1,
+            on_job_killed=lambda _args, reason: kill_reasons.append(reason),
+            on_job_error=lambda _args, error: errors.append(error),
+        )
+        pool.__enter__()
+        try:
+            pool.apply(
+                _mark_started_then_wait,
+                [str(started)],
+                callback=lambda _args: completed.set(),
+            )
+            assert _wait_for(started, 5)
+            pool.shutdown(force=True)
+            assert completed.wait(5)
+        finally:
+            pool.shutdown(force=True)
+            pool._mg_thrd.join(timeout=5)
+
+    assert kill_reasons == []
+    assert len(errors) == 1
+    assert errors[0].startswith("Worker process exited during pool shutdown ")
 
 
 @pytest.mark.parametrize("case", ["argument", "target", "reducer"])

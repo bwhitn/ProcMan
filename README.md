@@ -36,8 +36,9 @@ for its worker to acknowledge the job before that worker is replaced.
 
 Pool constructors also accept optional hooks. The hook helpers can build these hooks for logger-like objects passed in job args:
 
-- `on_job_killed(args, reason)`
-- `on_job_error(args, error)` for `PersistentProcPool`
+- `on_job_killed(args, reason)` for enforced time or memory limits
+- `on_job_error(args, error)` for `PersistentProcPool` target failures,
+  submission/start failures, abnormal worker exits, and interrupted shutdown jobs
 
 `reason` is one of:
 
@@ -50,6 +51,8 @@ Pool constructors also accept optional hooks. The hook helpers can build these h
   descendants.
 - `limit_time` is measured in seconds.
 - callbacks and hooks run in the parent process.
+- An abnormal persistent-worker exit reports its exit code or POSIX signal to
+  the error hook, replaces the worker, and then invokes the completion callback.
 - limit and completion callbacks run only after ProcMan has terminated the
   job's remaining contained descendants.
 

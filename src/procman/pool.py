@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import os
 from multiprocessing import Pipe, Process, Queue as MPQueue, SimpleQueue as MPSimpleQueue
 from queue import Empty, Queue
+from signal import Signals
 from threading import Thread
 from time import monotonic, sleep
 from typing import Any, Callable, Iterable, Optional
@@ -36,6 +38,24 @@ def _normalize_args(args: Iterable[Any]) -> JobArgs:
     if isinstance(args, tuple):
         return list(args)
     return list(args)
+
+
+def _worker_exit_error(exitcode: int | None, *, shutting_down: bool) -> str:
+    if exitcode is None:
+        status = "without an exit code"
+    elif exitcode < 0 and os.name == "posix":
+        signal_number = -exitcode
+        try:
+            signal_name = Signals(signal_number).name
+        except ValueError:
+            status = f"after signal {signal_number}"
+        else:
+            status = f"after signal {signal_number} ({signal_name})"
+    else:
+        status = f"with exit code {exitcode}"
+    if shutting_down:
+        return f"Worker process exited during pool shutdown {status}"
+    return f"Worker process exited unexpectedly {status}"
 
 
 def _safe_invoke_callback(callback: JobCallback | None, args: JobArgs, label: str) -> None:
@@ -612,6 +632,8 @@ class PersistentProcPool:
                 if proc is None:
                     continue
                 if not proc.is_alive():
+                    proc.join(timeout=0)
+                    exitcode = proc.exitcode
                     job = None
                     backend = None
                     if job_id is not None:
@@ -625,10 +647,18 @@ class PersistentProcPool:
                         replace_job_queue=replace_job_queue,
                     )
                     if job:
-                        _safe_invoke_kill_hook(
-                            self._on_job_killed,
+                        error = _worker_exit_error(
+                            exitcode,
+                            shutting_down=not self.running,
+                        )
+                        print(
+                            f"PersistentProcPool worker {worker_id} job "
+                            f"{job_id} failed: {error}"
+                        )
+                        _safe_invoke_error_hook(
+                            self._on_job_error,
                             job["args"],
-                            ProcPool.TIME,
+                            error,
                             "PersistentProcPool",
                         )
                         if job.get("callback"):
