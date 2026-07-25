@@ -735,6 +735,37 @@ def _blocking_task(started, release) -> None:
     release.wait(5)
 
 
+def _exercise_simultaneous_worker_recycling(result) -> None:
+    completed_count = 0
+    first_round_complete = Event()
+    second_round_complete = Event()
+
+    def completed(_args) -> None:
+        nonlocal completed_count
+        completed_count += 1
+        if completed_count == 4:
+            first_round_complete.set()
+        elif completed_count == 8:
+            second_round_complete.set()
+
+    with multiprocessing.Manager() as manager:
+        started = manager.Queue()
+        release = manager.Event()
+        with PersistentProcPool(4, max_tasks_per_worker=1) as pool:
+            for _ in range(4):
+                pool.apply(_blocking_task, [started, release], callback=completed)
+            if _wait_for_queue_items(started, 4) != 4:
+                return
+            release.set()
+            if not first_round_complete.wait(10):
+                return
+            for _ in range(4):
+                pool.apply(_consume, [], callback=completed)
+            if not second_round_complete.wait(10):
+                return
+    result.send(completed_count)
+
+
 def _wait_for_queue_items(queue, count: int, timeout: float = 5.0) -> int:
     deadline = time() + timeout
     seen = 0
@@ -761,6 +792,28 @@ def test_persistent_pool_starts_jobs_on_all_worker_slots() -> None:
             while time() < deadline and len(callbacks) < 4:
                 sleep(0.1)
     assert len(callbacks) == 4
+
+
+def test_persistent_pool_recycles_simultaneously_without_losing_completions() -> None:
+    context = multiprocessing.get_context("spawn")
+    result, child_result = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_exercise_simultaneous_worker_recycling,
+        args=(child_result,),
+    )
+    process.start()
+    child_result.close()
+    try:
+        assert result.poll(30), "persistent worker recycling deadlocked"
+        assert result.recv() == 8
+        process.join(timeout=5)
+        assert not process.is_alive()
+        assert process.exitcode == 0
+    finally:
+        if process.is_alive():
+            process.kill()
+            process.join(timeout=5)
+        result.close()
 
 
 def test_job_tracker_tracks_pending_and_done_jobs() -> None:

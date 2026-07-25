@@ -488,7 +488,11 @@ class PersistentProcPool:
         self._max_tasks = max_tasks_per_worker
         self._mp_context = _resolve_mp_context(mp_context)
         self._job_queues: dict[int, Any] = {}
-        self._done_queue: Any = self._mp_context.Queue()
+        # Workers are deliberately killed for limits and recycling. A regular
+        # multiprocessing.Queue can retain its shared writer lock when that
+        # happens, blocking completion reports from every surviving worker.
+        self._done_queue_manager: Any | None = None
+        self._done_queue: Any | None = None
         self._workers: dict[int, Any] = {}
         self._finishing_events: dict[int, Any] = {}
         self._running_jobs: dict[int, dict[str, Any]] = {}
@@ -507,6 +511,8 @@ class PersistentProcPool:
         return self._mp_context.get_start_method()
 
     def __enter__(self):
+        self._done_queue_manager = self._mp_context.Manager()
+        self._done_queue = self._done_queue_manager.Queue()
         try:
             for worker_id in range(self._proc_limit):
                 self._spawn_worker(worker_id)
@@ -514,6 +520,7 @@ class PersistentProcPool:
             self.running = False
             for worker_id in list(self._workers):
                 self._terminate_worker(worker_id)
+            self._close_done_queue()
             raise
         self._mg_thrd.start()
         self._accepting = True
@@ -522,6 +529,7 @@ class PersistentProcPool:
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.shutdown(force=True)
         self._mg_thrd.join()
+        self._close_done_queue()
 
     def shutdown(self, force: bool = False) -> None:
         with self._worker_condition:
@@ -548,7 +556,16 @@ class PersistentProcPool:
             except Exception:
                 pass
 
+    def _close_done_queue(self) -> None:
+        manager = self._done_queue_manager
+        self._done_queue = None
+        self._done_queue_manager = None
+        if manager is not None:
+            manager.shutdown()
+
     def _spawn_worker(self, worker_id: int) -> None:
+        if self._done_queue is None:
+            raise RuntimeError("persistent completion queue is not running")
         job_queue = self._job_queues.get(worker_id)
         if job_queue is None:
             job_queue = self._mp_context.SimpleQueue()
@@ -621,6 +638,9 @@ class PersistentProcPool:
             self._set_worker_idle(worker_id)
 
     def _thrd_mgr(self) -> None:
+        done_queue = self._done_queue
+        if done_queue is None:
+            return
         pending_message = None
         next_worker_check = monotonic()
         while self.running or self._running_jobs:
@@ -631,7 +651,7 @@ class PersistentProcPool:
                     pending_message = None
                 else:
                     try:
-                        msg = self._done_queue.get_nowait()
+                        msg = done_queue.get_nowait()
                     except Empty:
                         break
                 action, worker_id, job_id, payload = msg
@@ -699,7 +719,7 @@ class PersistentProcPool:
             now = monotonic()
             if now < next_worker_check:
                 try:
-                    pending_message = self._done_queue.get(
+                    pending_message = done_queue.get(
                         timeout=next_worker_check - now,
                     )
                 except Empty:
@@ -831,11 +851,12 @@ class PersistentProcPool:
                         continue
             next_worker_check = monotonic() + _MANAGER_INTERVAL
             try:
-                pending_message = self._done_queue.get(
+                pending_message = done_queue.get(
                     timeout=max(0.0, next_worker_check - monotonic()),
                 )
             except Empty:
                 pending_message = None
+        self._close_done_queue()
 
     def apply(
         self,
