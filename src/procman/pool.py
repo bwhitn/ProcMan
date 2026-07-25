@@ -647,7 +647,11 @@ class PersistentProcPool:
                         finishing_event.clear()
                     if payload.get("restart"):
                         backend = job.get("backend") if job else None
-                        self._restart_worker(worker_id, backend=backend)
+                        self._restart_worker(
+                            worker_id,
+                            backend=backend,
+                            replace_job_queue=True,
+                        )
                     else:
                         self._set_worker_idle(worker_id)
                     errors = []

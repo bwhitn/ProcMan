@@ -486,23 +486,36 @@ def test_persistent_pool_does_not_report_memory_failure_while_job_finishes(
 
 
 def test_persistent_pool_retires_before_advertising_worker_idle() -> None:
-    completed = Event()
+    first_completed = Event()
+    second_completed = Event()
     callback_worker_pids: list[int | None] = []
     errors: list[str] = []
     with PersistentProcPool(
         1,
         max_tasks_per_worker=1,
         on_job_error=lambda _args, error: errors.append(error),
+        start_ack_timeout=0.2,
     ) as pool:
         initial_pid = pool._workers[0].pid
 
-        def record_worker(_args) -> None:
+        def record_worker(_args, completed: Event) -> None:
             callback_worker_pids.append(pool._workers[0].pid)
             completed.set()
 
-        pool.apply(_consume, [], callback=record_worker)
-        assert completed.wait(5)
+        pool.apply(
+            _consume,
+            [],
+            callback=lambda args: record_worker(args, first_completed),
+        )
+        assert first_completed.wait(5)
         assert callback_worker_pids[0] != initial_pid
+        pool.apply(
+            _consume,
+            [],
+            callback=lambda args: record_worker(args, second_completed),
+        )
+        assert second_completed.wait(5)
+        assert callback_worker_pids[1] != callback_worker_pids[0]
 
     assert errors == []
 
