@@ -442,8 +442,12 @@ def _worker_loop(
             cleanup_error = f"{type(error).__name__}: {error}"
         if fatal is not None:
             raise fatal
-        restart = cleanup_error is not None or (
-            descendants and containment.restart_after_descendants
+        tasks += 1
+        retire = bool(max_tasks and tasks >= max_tasks)
+        restart = (
+            cleanup_error is not None
+            or (descendants and containment.restart_after_descendants)
+            or retire
         )
         done_queue.put(
             (
@@ -458,11 +462,11 @@ def _worker_loop(
                 },
             )
         )
-        tasks += 1
         if restart:
-            break
-        if max_tasks and tasks >= max_tasks:
-            done_queue.put(("exit", worker_id, None, None))
+            # The manager replaces this worker before advertising its slot as
+            # idle. Stay alive until then so process exit cannot overtake the
+            # asynchronous completion message.
+            job_queue.get()
             break
 
 

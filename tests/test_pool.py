@@ -485,6 +485,28 @@ def test_persistent_pool_does_not_report_memory_failure_while_job_finishes(
     assert errors == []
 
 
+def test_persistent_pool_retires_before_advertising_worker_idle() -> None:
+    completed = Event()
+    callback_worker_pids: list[int | None] = []
+    errors: list[str] = []
+    with PersistentProcPool(
+        1,
+        max_tasks_per_worker=1,
+        on_job_error=lambda _args, error: errors.append(error),
+    ) as pool:
+        initial_pid = pool._workers[0].pid
+
+        def record_worker(_args) -> None:
+            callback_worker_pids.append(pool._workers[0].pid)
+            completed.set()
+
+        pool.apply(_consume, [], callback=record_worker)
+        assert completed.wait(5)
+        assert callback_worker_pids[0] != initial_pid
+
+    assert errors == []
+
+
 @pytest.mark.parametrize("exit_code", [0, 17])
 def test_persistent_pool_reports_abnormal_exit_and_recovers(
     exit_code: int,
