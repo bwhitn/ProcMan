@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import multiprocessing
 import os
+from contextlib import suppress
+from multiprocessing.connection import Connection
+from multiprocessing.connection import wait as wait_connections
 from multiprocessing.context import BaseContext
 from queue import Empty, Queue
 from signal import Signals
 from threading import Condition, Thread
 from time import monotonic, sleep
-from typing import Any, Callable, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional, cast
 
 import psutil  # type: ignore[import-untyped]
 
@@ -179,7 +182,7 @@ class ProcPool:
             proc = self._mp_context.Process(  # type: ignore[attr-defined]
                 target=_run_proc_job,
                 args=(target, job_args, child_startup),
-                daemon=True,
+                daemon=False,
             )
             try:
                 proc.start()
@@ -379,7 +382,7 @@ class ProcPool:
 def _worker_loop(
     worker_id: int,
     job_queue: Any,
-    done_queue: Any,
+    completion_sender: Any,
     finishing_event: Any,
     max_tasks: int,
     startup,
@@ -405,7 +408,7 @@ def _worker_loop(
         try:
             backend = containment.enter_job()
         except BaseException as error:
-            done_queue.put(
+            completion_sender.send(
                 (
                     "containment_error",
                     worker_id,
@@ -414,7 +417,7 @@ def _worker_loop(
                 )
             )
             raise
-        done_queue.put(
+        completion_sender.send(
             (
                 "start",
                 worker_id,
@@ -433,8 +436,8 @@ def _worker_loop(
         descendants = False
         cleanup_error = None
         # Publish this synchronously before leaving the containment unit. The
-        # manager's completion queue is asynchronous, so it cannot by itself
-        # close the accounting race around finish_job().
+        # completion connection cannot by itself close the accounting race
+        # around finish_job().
         finishing_event.set()
         try:
             descendants = containment.finish_job()
@@ -449,7 +452,7 @@ def _worker_loop(
             or (descendants and containment.restart_after_descendants)
             or retire
         )
-        done_queue.put(
+        completion_sender.send(
             (
                 "done",
                 worker_id,
@@ -464,10 +467,11 @@ def _worker_loop(
         )
         if restart:
             # The manager replaces this worker before advertising its slot as
-            # idle. Stay alive until then so process exit cannot overtake the
-            # asynchronous completion message.
+            # idle. Stay alive until then so process exit cannot be treated as
+            # abnormal before the completion message is processed.
             job_queue.get()
             break
+    completion_sender.close()
 
 
 class PersistentProcPool:
@@ -488,11 +492,10 @@ class PersistentProcPool:
         self._max_tasks = max_tasks_per_worker
         self._mp_context = _resolve_mp_context(mp_context)
         self._job_queues: dict[int, Any] = {}
-        # Workers are deliberately killed for limits and recycling. A regular
-        # multiprocessing.Queue can retain its shared writer lock when that
-        # happens, blocking completion reports from every surviving worker.
-        self._done_queue_manager: Any | None = None
-        self._done_queue: Any | None = None
+        # Each worker exclusively owns one completion sender. Killing a worker
+        # can corrupt only that worker's connection instead of retaining a
+        # shared queue lock or blocking reports from surviving workers.
+        self._completion_receivers: dict[int, Connection] = {}
         self._workers: dict[int, Any] = {}
         self._finishing_events: dict[int, Any] = {}
         self._running_jobs: dict[int, dict[str, Any]] = {}
@@ -511,8 +514,6 @@ class PersistentProcPool:
         return self._mp_context.get_start_method()
 
     def __enter__(self):
-        self._done_queue_manager = self._mp_context.Manager()
-        self._done_queue = self._done_queue_manager.Queue()
         try:
             for worker_id in range(self._proc_limit):
                 self._spawn_worker(worker_id)
@@ -520,7 +521,7 @@ class PersistentProcPool:
             self.running = False
             for worker_id in list(self._workers):
                 self._terminate_worker(worker_id)
-            self._close_done_queue()
+            self._close_completion_channels()
             raise
         self._mg_thrd.start()
         self._accepting = True
@@ -529,7 +530,7 @@ class PersistentProcPool:
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.shutdown(force=True)
         self._mg_thrd.join()
-        self._close_done_queue()
+        self._close_completion_channels()
 
     def shutdown(self, force: bool = False) -> None:
         with self._worker_condition:
@@ -556,16 +557,76 @@ class PersistentProcPool:
             except Exception:
                 pass
 
-    def _close_done_queue(self) -> None:
-        manager = self._done_queue_manager
-        self._done_queue = None
-        self._done_queue_manager = None
-        if manager is not None:
-            manager.shutdown()
+    def _discard_completion_receiver(
+        self,
+        worker_id: int,
+        expected: Connection | None = None,
+    ) -> None:
+        receiver = None
+        with self._worker_condition:
+            current = self._completion_receivers.get(worker_id)
+            if expected is None or current is expected:
+                receiver = self._completion_receivers.pop(worker_id, None)
+                self._worker_condition.notify_all()
+            elif expected is not None:
+                receiver = expected
+        if receiver is not None:
+            with suppress(OSError):
+                receiver.close()
+
+    def _close_completion_channels(self) -> None:
+        with self._worker_condition:
+            receivers = list(self._completion_receivers.values())
+            self._completion_receivers.clear()
+            self._worker_condition.notify_all()
+        for receiver in receivers:
+            with suppress(OSError):
+                receiver.close()
+
+    def _receive_completion(self, timeout: float) -> Any | None:
+        deadline = monotonic() + max(0.0, timeout)
+        while True:
+            with self._worker_condition:
+                receivers = list(self._completion_receivers.items())
+                if not receivers:
+                    remaining = deadline - monotonic()
+                    if remaining <= 0:
+                        return None
+                    self._worker_condition.wait(remaining)
+                    continue
+            remaining = max(0.0, deadline - monotonic())
+            try:
+                ready = wait_connections(
+                    [receiver for _worker_id, receiver in receivers],
+                    timeout=remaining,
+                )
+            except (OSError, ValueError):
+                for worker_id, receiver in receivers:
+                    if receiver.closed:
+                        self._discard_completion_receiver(
+                            worker_id,
+                            expected=receiver,
+                        )
+                if monotonic() >= deadline:
+                    return None
+                continue
+            if not ready:
+                return None
+            worker_by_receiver = {receiver: worker_id for worker_id, receiver in receivers}
+            for ready_receiver in ready:
+                receiver = cast("Connection", ready_receiver)
+                worker_id = worker_by_receiver[receiver]
+                try:
+                    return receiver.recv()
+                except (EOFError, OSError):
+                    self._discard_completion_receiver(
+                        worker_id,
+                        expected=receiver,
+                    )
+            if monotonic() >= deadline:
+                return None
 
     def _spawn_worker(self, worker_id: int) -> None:
-        if self._done_queue is None:
-            raise RuntimeError("persistent completion queue is not running")
         job_queue = self._job_queues.get(worker_id)
         if job_queue is None:
             job_queue = self._mp_context.SimpleQueue()
@@ -573,21 +634,23 @@ class PersistentProcPool:
         finishing_event = self._mp_context.Event()
         self._finishing_events[worker_id] = finishing_event
         startup, child_startup = self._mp_context.Pipe(duplex=False)
+        completion_receiver, child_completion_sender = self._mp_context.Pipe(duplex=False)
         proc = self._mp_context.Process(  # type: ignore[attr-defined]
             target=_worker_loop,
             args=(
                 worker_id,
                 job_queue,
-                self._done_queue,
+                child_completion_sender,
                 finishing_event,
                 self._max_tasks,
                 child_startup,
             ),
-            daemon=True,
+            daemon=False,
         )
         try:
             proc.start()
             child_startup.close()
+            child_completion_sender.close()
             if not startup.poll(_WORKER_START_TIMEOUT):
                 raise RuntimeError("persistent worker did not establish containment")
             status, detail = startup.recv()
@@ -597,10 +660,19 @@ class PersistentProcPool:
             if proc.pid is not None:
                 terminate_containment(proc.pid, None)
                 proc.join(timeout=1)
+            completion_receiver.close()
             raise
         finally:
             startup.close()
             child_startup.close()
+            child_completion_sender.close()
+        with self._worker_condition:
+            previous = self._completion_receivers.get(worker_id)
+            self._completion_receivers[worker_id] = completion_receiver
+            self._worker_condition.notify_all()
+        if previous is not None:
+            with suppress(OSError):
+                previous.close()
         self._workers[worker_id] = proc
         self._set_worker_idle(worker_id)
 
@@ -629,6 +701,7 @@ class PersistentProcPool:
         replace_job_queue: bool = False,
     ) -> None:
         self._terminate_worker(worker_id, backend=backend)
+        self._discard_completion_receiver(worker_id)
         if replace_job_queue:
             self._discard_job_queue(worker_id)
         if self.running:
@@ -638,9 +711,6 @@ class PersistentProcPool:
             self._set_worker_idle(worker_id)
 
     def _thrd_mgr(self) -> None:
-        done_queue = self._done_queue
-        if done_queue is None:
-            return
         pending_message = None
         next_worker_check = monotonic()
         while self.running or self._running_jobs:
@@ -651,8 +721,10 @@ class PersistentProcPool:
                     pending_message = None
                 else:
                     try:
-                        msg = done_queue.get_nowait()
-                    except Empty:
+                        msg = self._receive_completion(0.0)
+                    except (OSError, ValueError):
+                        msg = None
+                    if msg is None:
                         break
                 action, worker_id, job_id, payload = msg
                 if action == "start":
@@ -719,10 +791,8 @@ class PersistentProcPool:
             now = monotonic()
             if now < next_worker_check:
                 try:
-                    pending_message = done_queue.get(
-                        timeout=next_worker_check - now,
-                    )
-                except Empty:
+                    pending_message = self._receive_completion(next_worker_check - now)
+                except (OSError, ValueError):
                     pending_message = None
                 continue
             for worker_id, job_id in list(self._worker_jobs.items()):
@@ -851,12 +921,10 @@ class PersistentProcPool:
                         continue
             next_worker_check = monotonic() + _MANAGER_INTERVAL
             try:
-                pending_message = done_queue.get(
-                    timeout=max(0.0, next_worker_check - monotonic()),
-                )
-            except Empty:
+                pending_message = self._receive_completion(max(0.0, next_worker_check - monotonic()))
+            except (OSError, ValueError):
                 pending_message = None
-        self._close_done_queue()
+        self._close_completion_channels()
 
     def apply(
         self,

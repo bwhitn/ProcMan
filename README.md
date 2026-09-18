@@ -67,6 +67,14 @@ Pool constructors also accept optional hooks. The hook helpers can build these h
   the error hook, replaces the worker, and then invokes the completion callback.
 - limit and completion callbacks run only after ProcMan has terminated the
   job's remaining contained descendants.
+- Worker processes are explicitly non-daemonic so a supervised job may create
+  multiprocessing children. ProcMan still joins or terminates every worker
+  explicitly; descendant cleanup and resource accounting apply to those
+  children as described below.
+- Each persistent worker owns a dedicated one-way completion connection. The
+  parent multiplexes those connections without a SyncManager process or a
+  shared writer lock, so terminating one worker cannot block completion
+  reports from the others.
 
 ## Process containment
 

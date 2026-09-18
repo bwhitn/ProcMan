@@ -166,6 +166,25 @@ def _spawn_reparented_grandchild_then_wait(marker: str) -> None:
     sleep(30)
 
 
+def _spawn_multiprocessing_child(worker_state: str, child_output: str) -> None:
+    Path(worker_state).write_text(
+        str(multiprocessing.current_process().daemon),
+        encoding="utf-8",
+    )
+    context = multiprocessing.get_context("spawn")
+    child = context.Process(target=_touch_file, args=(child_output,))
+    child.start()
+    child.join(timeout=5)
+    if child.is_alive():
+        child.kill()
+        child.join(timeout=5)
+        raise RuntimeError("spawned multiprocessing child did not finish")
+    if child.exitcode != 0:
+        raise RuntimeError(
+            f"spawned multiprocessing child exited with code {child.exitcode}"
+        )
+
+
 def _wait_for(path: Path, timeout: float) -> bool:
     deadline = time() + timeout
     while time() < deadline:
@@ -206,6 +225,27 @@ def test_pool_uses_safe_default_context(pool_type) -> None:
     expected = "forkserver" if "forkserver" in methods else "spawn"
     with pool_type(1) as pool:
         assert pool.start_method == expected
+
+
+@pytest.mark.parametrize(
+    "pool_type",
+    [ProcPool, PersistentProcPool],
+    ids=["one-shot", "persistent"],
+)
+def test_worker_is_non_daemon_and_can_spawn_multiprocessing_child(pool_type) -> None:
+    completed = Event()
+    with TemporaryDirectory() as tmpdir:
+        worker_state = Path(tmpdir).joinpath("worker-daemon.txt")
+        child_output = Path(tmpdir).joinpath("child-output.txt")
+        with pool_type(1) as pool:
+            pool.apply(
+                _spawn_multiprocessing_child,
+                [str(worker_state), str(child_output)],
+                callback=lambda _args: completed.set(),
+            )
+            assert completed.wait(10)
+        assert worker_state.read_text(encoding="utf-8") == "False"
+        assert child_output.read_text(encoding="utf-8") == "ok"
 
 
 @pytest.mark.parametrize(
@@ -444,6 +484,53 @@ def test_persistent_pool_completion_wakes_manager(
         assert completed.wait(0.75)
 
 
+def test_persistent_pool_does_not_start_sync_manager(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_manager(_context) -> None:
+        pytest.fail("PersistentProcPool must not create a SyncManager")
+
+    monkeypatch.setattr(pool_module.BaseContext, "Manager", fail_manager)
+    completed = Event()
+    with PersistentProcPool(1, mp_context="spawn") as pool:
+        assert len(pool._completion_receivers) == 1
+        pool.apply(_consume, [], callback=lambda _args: completed.set())
+        assert completed.wait(5)
+
+
+def test_persistent_workers_have_independent_completion_channels() -> None:
+    completed = Event()
+    crashed = Event()
+    errors: list[str] = []
+
+    def record_error(_args, error: str) -> None:
+        errors.append(error)
+        crashed.set()
+
+    with TemporaryDirectory() as tmpdir:
+        output = Path(tmpdir).joinpath("survivor.txt")
+        with PersistentProcPool(
+            2,
+            mp_context="spawn",
+            on_job_error=record_error,
+        ) as pool:
+            receivers = list(pool._completion_receivers.values())
+            assert len(receivers) == 2
+            assert len({receiver.fileno() for receiver in receivers}) == 2
+
+            pool.apply(_exit_worker, [17])
+            pool.apply(
+                _touch_file,
+                [str(output)],
+                callback=lambda _args: completed.set(),
+            )
+            assert completed.wait(5)
+            assert crashed.wait(5)
+            assert output.read_text(encoding="utf-8") == "ok"
+
+    assert errors == ["Worker process exited unexpectedly with exit code 17"]
+
+
 def test_persistent_pool_does_not_report_memory_failure_while_job_finishes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -494,9 +581,12 @@ def test_persistent_pool_retires_before_advertising_worker_idle() -> None:
         1,
         max_tasks_per_worker=1,
         on_job_error=lambda _args, error: errors.append(error),
-        start_ack_timeout=0.2,
+        # A recycled spawn/forkserver worker may need to import this test
+        # module before SimpleQueue.get() can return the deserialized target.
+        start_ack_timeout=1.0,
     ) as pool:
         initial_pid = pool._workers[0].pid
+        initial_receiver = pool._completion_receivers[0]
 
         def record_worker(_args, completed: Event) -> None:
             callback_worker_pids.append(pool._workers[0].pid)
@@ -509,6 +599,8 @@ def test_persistent_pool_retires_before_advertising_worker_idle() -> None:
         )
         assert first_completed.wait(5)
         assert callback_worker_pids[0] != initial_pid
+        assert initial_receiver.closed
+        assert pool._completion_receivers[0] is not initial_receiver
         pool.apply(
             _consume,
             [],
@@ -655,6 +747,7 @@ class _DroppingQueue:
 
 def test_persistent_pool_recovers_when_worker_does_not_acknowledge_job() -> None:
     errors: list[str] = []
+    warmed = Event()
     timed_out = Event()
     completed = Event()
     with TemporaryDirectory() as tmpdir:
@@ -665,6 +758,10 @@ def test_persistent_pool_recovers_when_worker_does_not_acknowledge_job() -> None
             on_job_error=lambda _args, error: errors.append(error),
             start_ack_timeout=0.1,
         ) as pool:
+            # Import this module in the worker before measuring a deliberately
+            # dropped queue write; module-import time is not under test here.
+            pool.apply(_consume, [], callback=lambda _args: warmed.set())
+            assert warmed.wait(5)
             pool._job_queues[0] = _DroppingQueue(pool._job_queues[0])
             pool.apply(
                 _touch_file,
@@ -678,6 +775,10 @@ def test_persistent_pool_recovers_when_worker_does_not_acknowledge_job() -> None
             assert pool._worker_jobs == {0: None}
             assert pool._running_jobs == {}
 
+            # The replacement worker must import this test module when it
+            # deserializes its first real target. Keep that cold-import time
+            # separate from the intentionally short dropped-job timeout.
+            pool._start_ack_timeout = 1.0
             pool.apply(
                 _touch_file,
                 [str(valid_path)],
