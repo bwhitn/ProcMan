@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import multiprocessing
 import os
+from collections import deque
+from collections.abc import Callable, Iterable
 from contextlib import suppress
 from multiprocessing.connection import Connection
 from multiprocessing.connection import wait as wait_connections
@@ -10,7 +12,7 @@ from queue import Empty, Queue
 from signal import Signals
 from threading import Condition, Thread
 from time import monotonic, sleep
-from typing import Any, Callable, Iterable, Optional, cast
+from typing import Any, cast
 
 import psutil  # type: ignore[import-untyped]
 
@@ -20,6 +22,7 @@ from procman._containment import (
     contained_rss,
     terminate_containment,
 )
+from procman._memory import available_memory_bytes
 
 JobArgs = list[Any]
 JobCallback = Callable[[JobArgs], None]
@@ -30,6 +33,7 @@ _WORKER_START_TIMEOUT = 10.0
 _JOB_START_ACK_TIMEOUT = 10.0
 _MANAGER_INTERVAL = 0.25
 _DESCENDANT_ERROR = "Job left descendant processes running; they were terminated."
+_MEBIBYTE = 1024 * 1024
 
 
 class JobSubmissionError(RuntimeError):
@@ -499,7 +503,10 @@ class PersistentProcPool:
         self._workers: dict[int, Any] = {}
         self._finishing_events: dict[int, Any] = {}
         self._running_jobs: dict[int, dict[str, Any]] = {}
-        self._worker_jobs: dict[int, Optional[int]] = {}
+        self._worker_jobs: dict[int, int | None] = {}
+        self._admission_waiters: deque[int] = deque()
+        self._admission_ceiling: int | None = None
+        self._admission_capacity: int | None = None
         self._job_id = 0
         self._on_job_killed = on_job_killed
         self._on_job_error = on_job_error
@@ -523,6 +530,8 @@ class PersistentProcPool:
                 self._terminate_worker(worker_id)
             self._close_completion_channels()
             raise
+        self._admission_ceiling = available_memory_bytes()
+        self._admission_capacity = self._admission_ceiling
         self._mg_thrd.start()
         self._accepting = True
         return self
@@ -681,6 +690,69 @@ class PersistentProcPool:
             self._worker_jobs[worker_id] = None
             self._worker_condition.notify_all()
 
+    def _pop_running_job(self, job_id: int) -> dict[str, Any] | None:
+        with self._worker_condition:
+            job = self._running_jobs.pop(job_id, None)
+            self._worker_condition.notify_all()
+            return job
+
+    def _reserved_memory_bytes(self) -> int:
+        return sum(
+            max(0, int(job["reserve_mem"])) * _MEBIBYTE
+            for job in self._running_jobs.values()
+        )
+
+    def _active_reserved_rss_bytes(self) -> int:
+        active_rss = 0
+        for job in self._running_jobs.values():
+            reservation = max(0, int(job["reserve_mem"])) * _MEBIBYTE
+            rss = max(0, int(job.get("rss", 0)))
+            active_rss += min(reservation, rss)
+        return active_rss
+
+    def _admission_capacity_bytes(self) -> int | None:
+        available = available_memory_bytes()
+        if available is None:
+            return self._admission_capacity
+
+        if not self._running_jobs:
+            # Rebase between waves so headroom released by unrelated workloads
+            # can be used without weakening reservations for an active wave.
+            self._admission_ceiling = available
+            self._admission_capacity = available
+            return available
+
+        dynamic_capacity = available + self._active_reserved_rss_bytes()
+        if self._admission_ceiling is None:
+            self._admission_ceiling = dynamic_capacity
+        self._admission_capacity = min(self._admission_ceiling, dynamic_capacity)
+        return self._admission_capacity
+
+    def _memory_admission_allows(self, limit_mem: int) -> bool:
+        requested = max(0, int(limit_mem)) * _MEBIBYTE
+        if requested == 0:
+            return True
+        reserved = self._reserved_memory_bytes()
+        # The initial/idle snapshot is sufficient for the common light-job
+        # path. Refresh only between waves or when a reservation would block.
+        if (
+            self._running_jobs
+            and self._admission_capacity is not None
+            and reserved + requested <= self._admission_capacity
+        ):
+            return True
+        capacity = self._admission_capacity_bytes()
+        if capacity is None:
+            # Preserve worker-slot scheduling if both host and cgroup telemetry
+            # are unavailable on a platform.
+            return True
+        if reserved + requested <= capacity:
+            return True
+        # A reservation is admission control, not a second per-job ceiling.
+        # Let an oversized job make progress when it has the pool to itself;
+        # its existing per-job limit remains authoritative while it runs.
+        return not self._running_jobs
+
     def _terminate_worker(self, worker_id: int, backend: str | None = None) -> None:
         proc = self._workers.get(worker_id)
         if proc is not None:
@@ -733,7 +805,7 @@ class PersistentProcPool:
                         job["start"] = payload["started"]
                         job["backend"] = payload["backend"]
                 elif action == "done":
-                    job = self._running_jobs.pop(job_id, None)
+                    job = self._pop_running_job(job_id)
                     finishing_event = self._finishing_events.get(worker_id)
                     if finishing_event is not None:
                         finishing_event.clear()
@@ -771,7 +843,7 @@ class PersistentProcPool:
                     if job and job.get("callback"):
                         _safe_invoke_callback(job["callback"], job["args"], "PersistentProcPool")
                 elif action == "containment_error":
-                    job = self._running_jobs.pop(job_id, None)
+                    job = self._pop_running_job(job_id)
                     self._restart_worker(worker_id)
                     if job:
                         _safe_invoke_error_hook(
@@ -805,7 +877,7 @@ class PersistentProcPool:
                     job = None
                     backend = None
                     if job_id is not None:
-                        job = self._running_jobs.pop(job_id, None)
+                        job = self._pop_running_job(job_id)
                         backend = job.get("backend") if job else None
                     replace_job_queue = bool(job and job.get("start") is None)
                     self._restart_worker(
@@ -847,7 +919,7 @@ class PersistentProcPool:
                     submitted = job.get("submitted")
                     if submitted is None or now - submitted <= self._start_ack_timeout:
                         continue
-                    self._running_jobs.pop(job_id, None)
+                    self._pop_running_job(job_id)
                     self._restart_worker(worker_id, replace_job_queue=True)
                     error = (
                         f"Worker did not acknowledge job {job_id} within "
@@ -871,7 +943,7 @@ class PersistentProcPool:
                         f"PersistentProcPool worker {worker_id} job {job_id} exceeded the time limit of "
                         f"{job['limit_time']} seconds"
                     )
-                    self._running_jobs.pop(job_id, None)
+                    self._pop_running_job(job_id)
                     self._restart_worker(worker_id, backend=job["backend"])
                     _safe_invoke_kill_hook(
                         self._on_job_killed,
@@ -886,11 +958,13 @@ class PersistentProcPool:
                             "PersistentProcPool",
                         )
                     continue
-                if job["limit_mem"]:
+                if job["limit_mem"] or job["reserve_mem"]:
                     if proc.pid is None:
                         continue
                     try:
-                        mem_mb = contained_rss(proc.pid, job["backend"]) / (1024 * 1024)
+                        rss = contained_rss(proc.pid, job["backend"])
+                        job["rss"] = rss
+                        mem_mb = rss / _MEBIBYTE
                     except ContainmentError as error:
                         if finishing_event is not None and finishing_event.is_set():
                             continue
@@ -899,12 +973,12 @@ class PersistentProcPool:
                             f"containment accounting failed: {error}"
                         )
                         mem_mb = float("inf")
-                    if mem_mb > job["limit_mem"]:
+                    if job["limit_mem"] and mem_mb > job["limit_mem"]:
                         print(
                             f"PersistentProcPool worker {worker_id} job {job_id} exceeded the memory limit of "
                             f"{job['limit_mem']}MB"
                         )
-                        self._running_jobs.pop(job_id, None)
+                        self._pop_running_job(job_id)
                         self._restart_worker(worker_id, backend=job["backend"])
                         _safe_invoke_kill_hook(
                             self._on_job_killed,
@@ -919,6 +993,9 @@ class PersistentProcPool:
                                 "PersistentProcPool",
                             )
                         continue
+            with self._worker_condition:
+                self._admission_capacity_bytes()
+                self._worker_condition.notify_all()
             next_worker_check = monotonic() + _MANAGER_INTERVAL
             try:
                 pending_message = self._receive_completion(max(0.0, next_worker_check - monotonic()))
@@ -933,42 +1010,67 @@ class PersistentProcPool:
         limit_mem: int = 0,
         limit_time: int = 0,
         callback: JobCallback | None = None,
+        reserve_mem: int | None = None,
     ):
         norm_args = _normalize_args(args)
+        if reserve_mem is None:
+            reserve_mem = limit_mem
+        if reserve_mem < 0:
+            raise ValueError("Invalid memory reservation")
         with self._worker_condition:
             if not self._accepting:
                 raise RuntimeError("PersistentProcPool is not accepting jobs")
             self._job_id += 1
             job_id = self._job_id
-            while self._accepting:
-                worker_id = next(
-                    (
-                        candidate
-                        for candidate, current in self._worker_jobs.items()
-                        if current is None
-                    ),
-                    None,
-                )
-                if worker_id is not None:
-                    job: dict[str, Any] = {
-                        "args": norm_args,
-                        "callback": callback,
-                        "limit_time": limit_time,
-                        "limit_mem": limit_mem,
-                        "start": None,
-                        "submitted": None,
-                    }
-                    self._running_jobs[job_id] = job
-                    self._worker_jobs[worker_id] = job_id
-                    break
-                self._worker_condition.wait()
-            else:
-                raise RuntimeError("PersistentProcPool is not accepting jobs")
+            self._admission_waiters.append(job_id)
+            try:
+                while self._accepting:
+                    worker_id = next(
+                        (
+                            candidate
+                            for candidate, current in self._worker_jobs.items()
+                            if current is None
+                        ),
+                        None,
+                    )
+                    is_next = self._admission_waiters[0] == job_id
+                    if (
+                        is_next
+                        and worker_id is not None
+                        and self._memory_admission_allows(reserve_mem)
+                    ):
+                        job: dict[str, Any] = {
+                            "args": norm_args,
+                            "callback": callback,
+                            "limit_time": limit_time,
+                            "limit_mem": limit_mem,
+                            "reserve_mem": reserve_mem,
+                            "start": None,
+                            "submitted": None,
+                            "rss": 0,
+                        }
+                        self._running_jobs[job_id] = job
+                        self._worker_jobs[worker_id] = job_id
+                        self._admission_waiters.popleft()
+                        self._worker_condition.notify_all()
+                        break
+                    timeout = (
+                        _MANAGER_INTERVAL
+                        if is_next and worker_id is not None
+                        else None
+                    )
+                    self._worker_condition.wait(timeout)
+                else:
+                    raise RuntimeError("PersistentProcPool is not accepting jobs")
+            finally:
+                if job_id in self._admission_waiters:
+                    self._admission_waiters.remove(job_id)
+                    self._worker_condition.notify_all()
 
         try:
             self._job_queues[worker_id].put((job_id, target, norm_args))
         except Exception as error:
-            self._running_jobs.pop(job_id, None)
+            self._pop_running_job(job_id)
             if isinstance(error, (EOFError, OSError, ValueError)):
                 self._restart_worker(worker_id, replace_job_queue=True)
             else:

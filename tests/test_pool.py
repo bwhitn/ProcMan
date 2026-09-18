@@ -4,12 +4,14 @@ import signal
 import subprocess
 import sys
 from pathlib import Path
+from queue import Empty
 from tempfile import TemporaryDirectory
 from threading import Event, Lock, Thread
 from time import sleep, time
 
-import procman.pool as pool_module
 import pytest
+
+import procman.pool as pool_module
 from procman import (
     JobSubmissionError,
     JobTracker,
@@ -836,6 +838,11 @@ def _blocking_task(started, release) -> None:
     release.wait(5)
 
 
+def _labeled_blocking_task(label: int, started, release) -> None:
+    started.put(label)
+    release.wait(10)
+
+
 def _exercise_simultaneous_worker_recycling(result) -> None:
     completed_count = 0
     first_round_complete = Event()
@@ -877,6 +884,250 @@ def _wait_for_queue_items(queue, count: int, timeout: float = 5.0) -> int:
             continue
         seen += 1
     return seen
+
+
+def _wait_for_admission_waiters(
+    pool: PersistentProcPool,
+    count: int,
+    timeout: float = 5.0,
+) -> bool:
+    deadline = time() + timeout
+    while time() < deadline:
+        with pool._worker_condition:
+            if len(pool._admission_waiters) == count:
+                return True
+        sleep(0.01)
+    return False
+
+
+def test_persistent_memory_admission_matches_four_gib_failure_shape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mib = 1024 * 1024
+    monkeypatch.setattr(
+        pool_module,
+        "available_memory_bytes",
+        lambda: 4 * 1024 * mib,
+    )
+    completed_count = 0
+    all_completed = Event()
+    submission_errors: list[BaseException] = []
+
+    def completed(_args) -> None:
+        nonlocal completed_count
+        completed_count += 1
+        if completed_count == 4:
+            all_completed.set()
+
+    with multiprocessing.Manager() as manager:
+        started = manager.Queue()
+        release = manager.Event()
+        with PersistentProcPool(4) as pool:
+            pool.apply(
+                _labeled_blocking_task,
+                [0, started, release],
+                limit_mem=3072,
+                reserve_mem=1800,
+                callback=completed,
+            )
+            pool.apply(
+                _labeled_blocking_task,
+                [1, started, release],
+                limit_mem=3072,
+                reserve_mem=1800,
+                callback=completed,
+            )
+
+            def submit(label: int) -> None:
+                try:
+                    pool.apply(
+                        _labeled_blocking_task,
+                        [label, started, release],
+                        limit_mem=3072,
+                        reserve_mem=1800,
+                        callback=completed,
+                    )
+                except Exception as error:
+                    submission_errors.append(error)
+
+            submitters = [Thread(target=submit, args=(label,)) for label in (2, 3)]
+            submitters[0].start()
+            assert _wait_for_admission_waiters(pool, 1)
+            submitters[1].start()
+            assert _wait_for_admission_waiters(pool, 2)
+            with pool._worker_condition:
+                assert list(pool._admission_waiters) == sorted(
+                    pool._admission_waiters
+                )
+
+            assert {started.get(timeout=5), started.get(timeout=5)} == {0, 1}
+            with pytest.raises(Empty):
+                started.get(timeout=0.5)
+            assert all(submitter.is_alive() for submitter in submitters)
+
+            release.set()
+            assert all_completed.wait(10)
+            for submitter in submitters:
+                submitter.join(timeout=2)
+                assert not submitter.is_alive()
+
+    assert completed_count == 4
+    assert submission_errors == []
+
+
+def test_memory_reservation_is_not_a_job_memory_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(pool_module, "available_memory_bytes", lambda: 1024 * 1024)
+    completed = Event()
+    kill_reasons: list[str] = []
+
+    with PersistentProcPool(
+        1,
+        on_job_killed=lambda _args, reason: kill_reasons.append(reason),
+    ) as pool:
+        pool.apply(
+            _consume,
+            [],
+            limit_mem=0,
+            reserve_mem=100,
+            callback=lambda _args: completed.set(),
+        )
+        assert completed.wait(5)
+
+    assert kill_reasons == []
+
+
+def test_persistent_pool_rejects_negative_memory_reservation() -> None:
+    with PersistentProcPool(1) as pool:
+        with pytest.raises(ValueError, match="memory reservation"):
+            pool.apply(_consume, [], reserve_mem=-1)
+
+
+def test_persistent_memory_admission_keeps_mixed_light_jobs_concurrent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mib = 1024 * 1024
+    monkeypatch.setattr(
+        pool_module,
+        "available_memory_bytes",
+        lambda: 300 * mib,
+    )
+    blocked_submission_done = Event()
+    submission_errors: list[Exception] = []
+
+    with multiprocessing.Manager() as manager:
+        started = manager.Queue()
+        release = manager.Event()
+        with PersistentProcPool(5) as pool:
+            for label, reserve_mem in ((0, 180), (1, 40), (2, 40), (3, 40)):
+                pool.apply(
+                    _labeled_blocking_task,
+                    [label, started, release],
+                    limit_mem=1000,
+                    reserve_mem=reserve_mem,
+                )
+
+            def submit_blocked_job() -> None:
+                try:
+                    pool.apply(
+                        _labeled_blocking_task,
+                        [4, started, release],
+                        limit_mem=1000,
+                        reserve_mem=180,
+                    )
+                except Exception as error:
+                    submission_errors.append(error)
+                else:
+                    blocked_submission_done.set()
+
+            submitter = Thread(target=submit_blocked_job)
+            submitter.start()
+
+            assert {started.get(timeout=5) for _ in range(4)} == {0, 1, 2, 3}
+            with pytest.raises(Empty):
+                started.get(timeout=0.5)
+            assert submitter.is_alive()
+
+            release.set()
+            submitter.join(timeout=5)
+            assert not submitter.is_alive()
+            assert blocked_submission_done.is_set()
+
+    assert submission_errors == []
+
+
+def test_persistent_memory_admission_falls_open_without_telemetry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(pool_module, "available_memory_bytes", lambda: None)
+    with multiprocessing.Manager() as manager:
+        started = manager.Queue()
+        release = manager.Event()
+        with PersistentProcPool(4) as pool:
+            for label in range(4):
+                pool.apply(
+                    _labeled_blocking_task,
+                    [label, started, release],
+                    limit_mem=10_000,
+                    reserve_mem=10_000,
+                )
+            assert {started.get(timeout=5) for _ in range(4)} == set(range(4))
+            release.set()
+
+
+def test_memory_blocked_persistent_apply_stops_on_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mib = 1024 * 1024
+    monkeypatch.setattr(
+        pool_module,
+        "available_memory_bytes",
+        lambda: 250 * mib,
+    )
+    errors: list[BaseException] = []
+
+    with multiprocessing.Manager() as manager:
+        started = manager.Queue()
+        release = manager.Event()
+        pool = PersistentProcPool(2)
+        pool.__enter__()
+        try:
+            pool.apply(
+                _labeled_blocking_task,
+                [0, started, release],
+                limit_mem=1000,
+                reserve_mem=200,
+            )
+            assert started.get(timeout=5) == 0
+
+            def submit_waiting_job() -> None:
+                try:
+                    pool.apply(
+                        _consume,
+                        [],
+                        limit_mem=1000,
+                        reserve_mem=100,
+                    )
+                except Exception as error:
+                    errors.append(error)
+
+            submitter = Thread(target=submit_waiting_job)
+            submitter.start()
+            sleep(0.25)
+            assert submitter.is_alive()
+            assert any(job is None for job in pool._worker_jobs.values())
+
+            pool.shutdown(force=True)
+            submitter.join(timeout=2)
+            assert not submitter.is_alive()
+        finally:
+            release.set()
+            pool.shutdown(force=True)
+            pool._mg_thrd.join(timeout=5)
+
+    assert len(errors) == 1
+    assert isinstance(errors[0], RuntimeError)
 
 
 def test_persistent_pool_starts_jobs_on_all_worker_slots() -> None:
