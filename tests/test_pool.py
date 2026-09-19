@@ -13,6 +13,8 @@ import pytest
 
 import procman.pool as pool_module
 from procman import (
+    JobDiagnostic,
+    JobQueueFull,
     JobSubmissionError,
     JobTracker,
     PersistentProcPool,
@@ -49,6 +51,7 @@ _DESCENDANT_ERROR_MESSAGE = (
     "Job left descendant processes running; they were terminated."
 )
 _INHERITED_LOCK = Lock()
+_RETAINED_MEMORY: bytearray | None = None
 
 
 def _touch_file(path: str) -> None:
@@ -103,6 +106,16 @@ class _ExplodingReduce:
 
 def _consume(*_values) -> None:
     return None
+
+
+def _write_pid(path: str) -> None:
+    Path(path).write_text(str(os.getpid()), encoding="utf-8")
+
+
+def _retain_memory_and_write_pid(path: str, size_mb: int) -> None:
+    global _RETAINED_MEMORY
+    _RETAINED_MEMORY = bytearray(size_mb * 1024 * 1024)
+    Path(path).write_text(str(os.getpid()), encoding="utf-8")
 
 
 def _mark_started_then_wait(path: str) -> None:
@@ -475,6 +488,24 @@ def test_persistent_pool_error_hook_runs() -> None:
     assert callbacks == [[]]
 
 
+def test_persistent_callback_can_apply_follow_up_without_deadlocking() -> None:
+    completed = Event()
+    with TemporaryDirectory() as tmpdir:
+        output = Path(tmpdir).joinpath("follow-up.txt")
+        with PersistentProcPool(1) as pool:
+            pool.apply(
+                _consume,
+                [],
+                callback=lambda _args: pool.apply(
+                    _touch_file,
+                    [str(output)],
+                    callback=lambda _follow_up_args: completed.set(),
+                ),
+            )
+            assert completed.wait(5)
+        assert output.read_text(encoding="utf-8") == "ok"
+
+
 def test_persistent_pool_completion_wakes_manager(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -574,6 +605,77 @@ def test_persistent_pool_does_not_report_memory_failure_while_job_finishes(
     assert errors == []
 
 
+def test_persistent_pool_reports_accounting_loss_as_memory_kill_and_recovers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(pool_module, "_MANAGER_INTERVAL", 0.01)
+    events: list[str] = []
+    diagnostics: list[str] = []
+    completed = Event()
+    recovered = Event()
+
+    def accounting_unavailable(_pid: int, _backend: str) -> int:
+        raise pool_module.ContainmentError("forced missing containment unit")
+
+    monkeypatch.setattr(pool_module, "contained_rss", accounting_unavailable)
+    with PersistentProcPool(
+        1,
+        on_job_killed=lambda _args, reason: events.append(f"kill:{reason}"),
+        on_job_error=lambda _args, error: (
+            diagnostics.append(error),
+            events.append("diagnostic"),
+        ),
+    ) as pool:
+        terminate_containment_real = pool_module.terminate_containment
+        termination_failed = False
+
+        def containment_already_gone(pid: int, backend: str | None):
+            nonlocal termination_failed
+            if backend is not None and not termination_failed:
+                termination_failed = True
+                raise pool_module.ContainmentError("forced cleanup race")
+            return terminate_containment_real(pid, backend)
+
+        monkeypatch.setattr(
+            pool_module,
+            "terminate_containment",
+            containment_already_gone,
+        )
+        initial_pid = pool._workers[0].pid
+        handle = pool.submit(
+            sleep,
+            [30],
+            limit_mem=1,
+            callback=lambda _args: (events.append("callback"), completed.set()),
+        )
+
+        assert completed.wait(5)
+        assert handle.wait(0.1)
+        assert not handle.successful()
+        assert handle.kill_reason == ProcPool.MEM
+        assert pool._workers[0].pid != initial_pid
+        assert pool._running_jobs == {}
+        assert pool._worker_jobs == {0: None}
+
+        recovery = pool.submit(
+            _consume,
+            [],
+            callback=lambda _args: recovered.set(),
+        )
+        assert recovered.wait(5)
+        assert recovery.wait(0.1)
+        assert recovery.successful()
+
+    assert events == ["kill:memory", "diagnostic", "callback"]
+    assert len(diagnostics) == 1
+    diagnostic = diagnostics[0]
+    assert isinstance(diagnostic, JobDiagnostic)
+    assert diagnostic.diagnostic["code"] == "accounting_unavailable"
+    assert diagnostic.diagnostic["worker_id"] == 0
+    assert "forced cleanup race" in diagnostic.diagnostic["cleanup_error"]
+    assert "forced missing containment unit" in diagnostic
+
+
 def test_persistent_pool_retires_before_advertising_worker_idle() -> None:
     first_completed = Event()
     second_completed = Event()
@@ -612,6 +714,48 @@ def test_persistent_pool_retires_before_advertising_worker_idle() -> None:
         assert callback_worker_pids[1] != callback_worker_pids[0]
 
     assert errors == []
+
+
+def test_retirement_hint_replaces_only_retaining_worker() -> None:
+    callbacks: list[str] = []
+    with TemporaryDirectory() as tmpdir:
+        retained_pid_path = Path(tmpdir).joinpath("retained.pid")
+        first_light_pid_path = Path(tmpdir).joinpath("light-1.pid")
+        second_light_pid_path = Path(tmpdir).joinpath("light-2.pid")
+        with PersistentProcPool(1) as pool:
+            retaining_worker = pool._workers[0]
+            retained = pool.submit(
+                _retain_memory_and_write_pid,
+                [str(retained_pid_path), 16],
+                retire_worker=True,
+                callback=lambda _args: callbacks.append("retained"),
+            )
+            assert retained.wait(5)
+            assert retained.successful()
+            retained_pid = int(retained_pid_path.read_text(encoding="utf-8"))
+            replacement_pid = pool._workers[0].pid
+            assert not retaining_worker.is_alive()
+            assert replacement_pid != retained_pid
+
+            first_light = pool.submit(
+                _write_pid,
+                [str(first_light_pid_path)],
+                callback=lambda _args: callbacks.append("light-1"),
+            )
+            assert first_light.wait(5)
+            second_light = pool.submit(
+                _write_pid,
+                [str(second_light_pid_path)],
+                callback=lambda _args: callbacks.append("light-2"),
+            )
+            assert second_light.wait(5)
+
+            first_light_pid = int(first_light_pid_path.read_text(encoding="utf-8"))
+            second_light_pid = int(second_light_pid_path.read_text(encoding="utf-8"))
+            assert first_light_pid == replacement_pid
+            assert second_light_pid == replacement_pid
+
+    assert callbacks == ["retained", "light-1", "light-2"]
 
 
 @pytest.mark.parametrize("exit_code", [0, 17])
@@ -734,6 +878,33 @@ def test_persistent_pool_rejects_unpickleable_job_without_losing_slot(
 
         pool.apply(_consume, ["valid"], callback=lambda _args: completed.set())
         assert completed.wait(5)
+
+
+def test_submit_rejects_bad_serialization_and_reports_target_error() -> None:
+    errors: list[str] = []
+    completed = Event()
+    with PersistentProcPool(
+        1,
+        max_pending_jobs=1,
+        on_job_error=lambda _args, error: errors.append(error),
+    ) as pool:
+        with pytest.raises(JobSubmissionError):
+            pool.submit(_consume, [_ExplodingReduce()])
+        assert pool._pending_jobs == {}
+        assert list(pool._admission_waiters) == []
+
+        handle = pool.submit(
+            _raise_error,
+            [],
+            callback=lambda _args: completed.set(),
+        )
+        assert completed.wait(5)
+        assert handle.wait(0.1)
+        assert handle.done()
+        assert not handle.successful()
+        assert handle.error == "RuntimeError: boom"
+
+    assert errors == ["RuntimeError: boom"]
 
 
 class _DroppingQueue:
@@ -1004,6 +1175,184 @@ def test_persistent_pool_rejects_negative_memory_reservation() -> None:
             pool.apply(_consume, [], reserve_mem=-1)
 
 
+def test_persistent_pool_rejects_invalid_pending_job_limit() -> None:
+    with pytest.raises(ValueError, match="pending-job limit"):
+        PersistentProcPool(1, max_pending_jobs=0)
+
+
+def test_nonblocking_submission_is_bounded_and_pending_jobs_are_cancellable() -> None:
+    callbacks: list[str] = []
+    errors: list[str] = []
+    with TemporaryDirectory() as tmpdir:
+        started = Path(tmpdir).joinpath("started.txt")
+        release = Path(tmpdir).joinpath("release.txt")
+        cancelled_output = Path(tmpdir).joinpath("cancelled.txt")
+        accepted_output = Path(tmpdir).joinpath("accepted.txt")
+        with PersistentProcPool(
+            1,
+            max_pending_jobs=1,
+            on_job_error=lambda _args, error: errors.append(error),
+        ) as pool:
+            pool.apply(
+                _mark_started_then_wait_for_release,
+                [str(started), str(release)],
+            )
+            assert _wait_for(started, 5)
+
+            cancelled = pool.submit(
+                _touch_file,
+                [str(cancelled_output)],
+                callback=lambda _args: callbacks.append("cancelled"),
+            )
+            with pytest.raises(JobQueueFull, match="pending-job limit"):
+                pool.submit(_consume, [])
+
+            assert cancelled.cancel()
+            assert cancelled.wait(0.1)
+            assert cancelled.cancelled()
+            assert not cancelled.started()
+            assert not cancelled.cancel()
+
+            accepted = pool.submit(
+                _touch_file,
+                [str(accepted_output)],
+                callback=lambda _args: callbacks.append("accepted"),
+            )
+            release.write_text("go", encoding="utf-8")
+            assert accepted.wait(5)
+            assert accepted.successful()
+
+        assert not cancelled_output.exists()
+        assert accepted_output.read_text(encoding="utf-8") == "ok"
+
+    assert callbacks == ["cancelled", "accepted"]
+    assert errors == ["Persistent job was cancelled before dispatch."]
+
+
+def test_shutdown_cancels_accepted_nonblocking_job_with_complete_outcome() -> None:
+    callbacks: list[str] = []
+    errors: list[tuple[list[object], str]] = []
+    with TemporaryDirectory() as tmpdir:
+        started = Path(tmpdir).joinpath("started.txt")
+        pending_output = Path(tmpdir).joinpath("pending.txt")
+        pool = PersistentProcPool(
+            1,
+            max_pending_jobs=1,
+            on_job_error=lambda args, error: errors.append((args, error)),
+        )
+        pool.__enter__()
+        try:
+            pool.apply(_mark_started_then_wait, [str(started)])
+            assert _wait_for(started, 5)
+            pending = pool.submit(
+                _touch_file,
+                [str(pending_output)],
+                callback=lambda _args: callbacks.append("pending"),
+            )
+
+            pool.shutdown(force=True)
+            assert pending.wait(1)
+            assert pending.cancelled()
+            assert not pending_output.exists()
+        finally:
+            pool.shutdown(force=True)
+            pool._mg_thrd.join(timeout=5)
+
+    assert callbacks == ["pending"]
+    pending_errors = [error for args, error in errors if args == [str(pending_output)]]
+    assert pending_errors == [
+        "Persistent job was cancelled before dispatch because the pool shut down."
+    ]
+
+
+def test_fair_admission_backfills_light_waves_without_starving_heavy_backlog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mib = 1024 * 1024
+    monkeypatch.setattr(
+        pool_module,
+        "available_memory_bytes",
+        lambda: 200 * mib,
+    )
+    callbacks: list[str] = []
+    with TemporaryDirectory() as tmpdir:
+        anchor_started = Path(tmpdir).joinpath("anchor-started.txt")
+        anchor_release = Path(tmpdir).joinpath("anchor-release.txt")
+        heavy_started = [
+            Path(tmpdir).joinpath(f"heavy-{index}-started.txt")
+            for index in range(2)
+        ]
+        heavy_release = [
+            Path(tmpdir).joinpath(f"heavy-{index}-release.txt")
+            for index in range(2)
+        ]
+        light_outputs = [
+            Path(tmpdir).joinpath(f"light-{index}.txt") for index in range(4)
+        ]
+
+        with PersistentProcPool(3, max_pending_jobs=10) as pool:
+            pool.apply(
+                _mark_started_then_wait_for_release,
+                [str(anchor_started), str(anchor_release)],
+                reserve_mem=150,
+                callback=lambda _args: callbacks.append("anchor"),
+            )
+            assert _wait_for(anchor_started, 5)
+
+            heavies = [
+                pool.submit(
+                    _mark_started_then_wait_for_release,
+                    [str(heavy_started[index]), str(heavy_release[index])],
+                    reserve_mem=150,
+                    callback=lambda _args, label=f"heavy-{index}": callbacks.append(
+                        label
+                    ),
+                )
+                for index in range(2)
+            ]
+            lights = [
+                pool.submit(
+                    _touch_file,
+                    [str(output)],
+                    reserve_mem=25,
+                    callback=lambda _args, label=f"light-{index}": callbacks.append(
+                        label
+                    ),
+                )
+                for index, output in enumerate(light_outputs)
+            ]
+
+            assert all(_wait_for(output, 5) for output in light_outputs[:3])
+            sleep(0.25)
+            assert not any(path.exists() for path in heavy_started)
+            assert not light_outputs[3].exists()
+            assert not any(heavy.started() for heavy in heavies)
+
+            anchor_release.write_text("go", encoding="utf-8")
+            assert _wait_for(heavy_started[0], 5)
+            assert heavies[0].started()
+            assert _wait_for(light_outputs[3], 5)
+            assert not heavy_started[1].exists()
+            heavy_release[0].write_text("go", encoding="utf-8")
+            assert _wait_for(heavy_started[1], 5)
+            heavy_release[1].write_text("go", encoding="utf-8")
+
+            assert all(heavy.wait(5) for heavy in heavies)
+            assert all(light.wait(5) for light in lights)
+            assert all(heavy.successful() for heavy in heavies)
+            assert all(light.successful() for light in lights)
+
+    assert set(callbacks) == {
+        "anchor",
+        "heavy-0",
+        "heavy-1",
+        "light-0",
+        "light-1",
+        "light-2",
+        "light-3",
+    }
+
+
 def test_persistent_memory_admission_keeps_mixed_light_jobs_concurrent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1210,6 +1559,14 @@ def test_logger_hook_helpers_write_procman_error_payloads() -> None:
 
     make_job_killed_hook("error_event")(args, ProcPool.TIME)
     make_job_error_hook("error_event")(args, "boom")
+    make_job_error_hook("error_event")(
+        args,
+        JobDiagnostic(
+            "accounting unavailable",
+            code="accounting_unavailable",
+            details={"worker_id": 2},
+        ),
+    )
 
     assert logger.messages[0] == {
         "error_event": {
@@ -1220,4 +1577,8 @@ def test_logger_hook_helpers_write_procman_error_payloads() -> None:
         }
     }
     assert logger.messages[1]["error_event"]["error"] == "Worker exception: boom"
+    assert logger.messages[2]["error_event"]["diagnostic"] == {
+        "code": "accounting_unavailable",
+        "worker_id": 2,
+    }
     assert logger.sent is True

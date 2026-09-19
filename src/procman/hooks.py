@@ -108,14 +108,16 @@ def job_error_payload(args: Iterable[Any], error: str, error_event_key: Any = "e
     args = list(args)
     analyzer_group = find_analyzer_group(args)
     message = str(error or "Worker process raised an exception.")
-    return {
-        error_event_key: {
-            "hash": find_hash(args),
-            "analyzer": find_analyzer_name(args, analyzer_group),
-            "analyzer_group": analyzer_group,
-            "error": f"Worker exception: {message}",
-        }
+    event: dict[str, Any] = {
+        "hash": find_hash(args),
+        "analyzer": find_analyzer_name(args, analyzer_group),
+        "analyzer_group": analyzer_group,
+        "error": f"Worker exception: {message}",
     }
+    diagnostic = getattr(error, "diagnostic", None)
+    if isinstance(diagnostic, Mapping):
+        event["diagnostic"] = dict(diagnostic)
+    return {error_event_key: event}
 
 
 def make_job_killed_hook(error_event_key: Any = "error") -> Callable[[list[Any], str], None]:
