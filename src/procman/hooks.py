@@ -45,7 +45,11 @@ def _display_name(item: Any) -> str | None:
 
 def find_analyzer_group(args: Iterable[Any]) -> list[str] | None:
     for arg in args:
-        if not isinstance(arg, Sequence) or isinstance(arg, (bytes, bytearray, str)) or not arg:
+        if (
+            not isinstance(arg, Sequence)
+            or isinstance(arg, (bytes, bytearray, str))
+            or not arg
+        ):
             continue
         names = [_display_name(item) for item in arg]
         if all(name is not None for name in names):
@@ -53,7 +57,9 @@ def find_analyzer_group(args: Iterable[Any]) -> list[str] | None:
     return None
 
 
-def find_analyzer_name(args: Iterable[Any], analyzer_group: list[str] | None = None) -> str | None:
+def find_analyzer_name(
+    args: Iterable[Any], analyzer_group: list[str] | None = None
+) -> str | None:
     for arg in args:
         if isinstance(arg, Mapping):
             analyzer = arg.get("analyzer")
@@ -91,7 +97,9 @@ def _write_to_loggers(args: list[Any], payload: Mapping[Any, Any]) -> None:
     flush_loggers(args)
 
 
-def job_killed_payload(args: Iterable[Any], reason: str, error_event_key: Any = "error") -> dict[Any, dict[str, Any]]:
+def job_killed_payload(
+    args: Iterable[Any], reason: str, error_event_key: Any = "error"
+) -> dict[Any, dict[str, Any]]:
     args = list(args)
     analyzer_group = find_analyzer_group(args)
     return {
@@ -104,7 +112,9 @@ def job_killed_payload(args: Iterable[Any], reason: str, error_event_key: Any = 
     }
 
 
-def job_error_payload(args: Iterable[Any], error: str, error_event_key: Any = "error") -> dict[Any, dict[str, Any]]:
+def job_error_payload(
+    args: Iterable[Any], error: str, error_event_key: Any = "error"
+) -> dict[Any, dict[str, Any]]:
     args = list(args)
     analyzer_group = find_analyzer_group(args)
     message = str(error or "Worker process raised an exception.")
@@ -120,14 +130,18 @@ def job_error_payload(args: Iterable[Any], error: str, error_event_key: Any = "e
     return {error_event_key: event}
 
 
-def make_job_killed_hook(error_event_key: Any = "error") -> Callable[[list[Any], str], None]:
+def make_job_killed_hook(
+    error_event_key: Any = "error",
+) -> Callable[[list[Any], str], None]:
     def handle_job_killed(args: list[Any], reason: str) -> None:
         _write_to_loggers(args, job_killed_payload(args, reason, error_event_key))
 
     return handle_job_killed
 
 
-def make_job_error_hook(error_event_key: Any = "error") -> Callable[[list[Any], str], None]:
+def make_job_error_hook(
+    error_event_key: Any = "error",
+) -> Callable[[list[Any], str], None]:
     def handle_job_error(args: list[Any], error: str) -> None:
         _write_to_loggers(args, job_error_payload(args, error, error_event_key))
 

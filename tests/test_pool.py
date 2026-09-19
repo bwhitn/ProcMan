@@ -225,7 +225,11 @@ def test_proc_pool_callback_runs() -> None:
     with TemporaryDirectory() as tmpdir:
         out_path = Path(tmpdir).joinpath("out.txt")
         with ProcPool(1) as pool:
-            pool.apply(_touch_file, [str(out_path)], callback=lambda args: callbacks.append(args))
+            pool.apply(
+                _touch_file,
+                [str(out_path)],
+                callback=lambda args: callbacks.append(args),
+            )
         assert out_path.is_file()
     assert callbacks
 
@@ -460,11 +464,14 @@ def test_process_group_termination_also_terminates_root_outside_group() -> None:
     )
     try:
         assert os.getpgid(child.pid) != child.pid
-        assert terminate_containment(
-            child.pid,
-            POSIX_PROCESS_GROUP,
-            timeout=1,
-        ) == []
+        assert (
+            terminate_containment(
+                child.pid,
+                POSIX_PROCESS_GROUP,
+                timeout=1,
+            )
+            == []
+        )
         assert child.wait(timeout=2) != 0
     finally:
         if child.poll() is None:
@@ -781,7 +788,10 @@ def test_persistent_pool_reports_abnormal_exit_and_recovers(
             assert crashed.wait(5)
             assert kill_reasons == []
             assert errors == [
-                ([exit_code], f"Worker process exited unexpectedly with exit code {exit_code}")
+                (
+                    [exit_code],
+                    f"Worker process exited unexpectedly with exit code {exit_code}",
+                )
             ]
 
             pool.apply(
@@ -861,6 +871,7 @@ def test_persistent_pool_rejects_unpickleable_job_without_losing_slot(
         if case == "argument":
             args = [Lock()]
         elif case == "target":
+
             def local_target() -> None:
                 return None
 
@@ -1127,9 +1138,7 @@ def test_persistent_memory_admission_matches_four_gib_failure_shape(
             submitters[1].start()
             assert _wait_for_admission_waiters(pool, 2)
             with pool._worker_condition:
-                assert list(pool._admission_waiters) == sorted(
-                    pool._admission_waiters
-                )
+                assert list(pool._admission_waiters) == sorted(pool._admission_waiters)
 
             assert {started.get(timeout=5), started.get(timeout=5)} == {0, 1}
             with pytest.raises(Empty):
@@ -1279,12 +1288,10 @@ def test_fair_admission_backfills_light_waves_without_starving_heavy_backlog(
         anchor_started = Path(tmpdir).joinpath("anchor-started.txt")
         anchor_release = Path(tmpdir).joinpath("anchor-release.txt")
         heavy_started = [
-            Path(tmpdir).joinpath(f"heavy-{index}-started.txt")
-            for index in range(2)
+            Path(tmpdir).joinpath(f"heavy-{index}-started.txt") for index in range(2)
         ]
         heavy_release = [
-            Path(tmpdir).joinpath(f"heavy-{index}-release.txt")
-            for index in range(2)
+            Path(tmpdir).joinpath(f"heavy-{index}-release.txt") for index in range(2)
         ]
         light_outputs = [
             Path(tmpdir).joinpath(f"light-{index}.txt") for index in range(4)
@@ -1486,7 +1493,11 @@ def test_persistent_pool_starts_jobs_on_all_worker_slots() -> None:
         release = manager.Event()
         with PersistentProcPool(4) as pool:
             for _ in range(4):
-                pool.apply(_blocking_task, [started, release], callback=lambda args: callbacks.append(args))
+                pool.apply(
+                    _blocking_task,
+                    [started, release],
+                    callback=lambda args: callbacks.append(args),
+                )
             assert _wait_for_queue_items(started, 4) == 4
             release.set()
             deadline = time() + 5

@@ -146,7 +146,9 @@ def _resolve_mp_context(mp_context: BaseContext | str | None) -> BaseContext:
         return multiprocessing.get_context(mp_context)
     if isinstance(mp_context, BaseContext):
         return mp_context
-    raise TypeError("mp_context must be a multiprocessing context, start-method name, or None")
+    raise TypeError(
+        "mp_context must be a multiprocessing context, start-method name, or None"
+    )
 
 
 def _normalize_args(args: Iterable[Any]) -> JobArgs:
@@ -175,7 +177,9 @@ def _worker_exit_error(exitcode: int | None, *, shutting_down: bool) -> str:
     return f"Worker process exited unexpectedly {status}"
 
 
-def _safe_invoke_callback(callback: JobCallback | None, args: JobArgs, label: str) -> None:
+def _safe_invoke_callback(
+    callback: JobCallback | None, args: JobArgs, label: str
+) -> None:
     if callback is None:
         return
     try:
@@ -187,7 +191,9 @@ def _safe_invoke_callback(callback: JobCallback | None, args: JobArgs, label: st
         print(traceback.format_exc())
 
 
-def _safe_invoke_kill_hook(hook: JobKillHook | None, args: JobArgs, reason: str, label: str) -> None:
+def _safe_invoke_kill_hook(
+    hook: JobKillHook | None, args: JobArgs, reason: str, label: str
+) -> None:
     if hook is None:
         return
     try:
@@ -199,7 +205,9 @@ def _safe_invoke_kill_hook(hook: JobKillHook | None, args: JobArgs, reason: str,
         print(traceback.format_exc())
 
 
-def _safe_invoke_error_hook(hook: JobErrorHook | None, args: JobArgs, error: str, label: str) -> None:
+def _safe_invoke_error_hook(
+    hook: JobErrorHook | None, args: JobArgs, error: str, label: str
+) -> None:
     if hook is None:
         return
     try:
@@ -329,7 +337,9 @@ class ProcPool:
             psproc = self.get_psproc()
             if psproc and self._pid > 0 and self._limit_mem != 0:
                 try:
-                    mem_mb = contained_rss(self._pid, self._backend or "") / (1024 * 1024)
+                    mem_mb = contained_rss(self._pid, self._backend or "") / (
+                        1024 * 1024
+                    )
                 except ContainmentError as error:
                     print(f"Process {self._pid} containment accounting failed: {error}")
                     return True
@@ -414,22 +424,31 @@ class ProcPool:
             sleep(_MANAGER_INTERVAL)
             remove_pids = []
             for pid, proc in self._procs.items():
-                if not proc.is_alive() or proc.status() in (psutil.STATUS_ZOMBIE, psutil.STATUS_DEAD):
+                if not proc.is_alive() or proc.status() in (
+                    psutil.STATUS_ZOMBIE,
+                    psutil.STATUS_DEAD,
+                ):
                     remove_pids.append(pid)
                     continue
                 if proc.is_time_exceeded():
-                    print(f"Process {pid} exceeded the time limit of {proc.get_time_limit()} seconds")
+                    print(
+                        f"Process {pid} exceeded the time limit of {proc.get_time_limit()} seconds"
+                    )
                     proc.kill(ProcPool.TIME)
                     continue
                 if proc.is_mem_exceeded():
-                    print(f"Process {pid} exceeded the memory limit of {proc.get_mem_limit()}MB")
+                    print(
+                        f"Process {pid} exceeded the memory limit of {proc.get_mem_limit()}MB"
+                    )
                     proc.kill(ProcPool.MEM)
                     continue
             for pid in remove_pids:
                 proc = self._procs.pop(pid)
                 proc.cleanup()
                 if proc.reason():
-                    _safe_invoke_kill_hook(self._on_job_killed, proc.get_args(), proc.reason(), "ProcPool")
+                    _safe_invoke_kill_hook(
+                        self._on_job_killed, proc.get_args(), proc.reason(), "ProcPool"
+                    )
                 _safe_invoke_callback(proc.get_callback(), proc.get_args(), "ProcPool")
                 self._ids.add(proc.get_pool_pid())
             while (not self._queue.empty()) and (len(self._procs) < self._proc_limit):
@@ -444,7 +463,9 @@ class ProcPool:
                         import traceback
 
                         print(traceback.format_exc())
-                        _safe_invoke_callback(proc.get_callback(), proc.get_args(), "ProcPool")
+                        _safe_invoke_callback(
+                            proc.get_callback(), proc.get_args(), "ProcPool"
+                        )
                     else:
                         self._procs[proc.pid] = proc
                 except Empty:
@@ -477,7 +498,13 @@ class ProcPool:
         callback: JobCallback | None = None,
     ):
         for item in iterables:
-            self.apply(target=func, args=item, limit_mem=limit_mem, limit_time=limit_time, callback=callback)
+            self.apply(
+                target=func,
+                args=item,
+                limit_mem=limit_mem,
+                limit_time=limit_time,
+                callback=callback,
+            )
 
 
 def _worker_loop(
@@ -852,7 +879,9 @@ class PersistentProcPool:
                 continue
             if not ready:
                 return None
-            worker_by_receiver = {receiver: worker_id for worker_id, receiver in receivers}
+            worker_by_receiver = {
+                receiver: worker_id for worker_id, receiver in receivers
+            }
             for ready_receiver in ready:
                 receiver = cast("Connection", ready_receiver)
                 if receiver is self._wakeup_receiver:
@@ -882,7 +911,9 @@ class PersistentProcPool:
         finishing_event = self._mp_context.Event()
         self._finishing_events[worker_id] = finishing_event
         startup, child_startup = self._mp_context.Pipe(duplex=False)
-        completion_receiver, child_completion_sender = self._mp_context.Pipe(duplex=False)
+        completion_receiver, child_completion_sender = self._mp_context.Pipe(
+            duplex=False
+        )
         proc = self._mp_context.Process(  # type: ignore[attr-defined]
             target=_worker_loop,
             args=(
@@ -903,7 +934,9 @@ class PersistentProcPool:
                 raise RuntimeError("persistent worker did not establish containment")
             status, detail = startup.recv()
             if status != "ready":
-                raise RuntimeError(f"persistent worker containment setup failed: {detail}")
+                raise RuntimeError(
+                    f"persistent worker containment setup failed: {detail}"
+                )
         except BaseException:
             if proc.pid is not None:
                 terminate_containment(proc.pid, None)
@@ -1327,7 +1360,9 @@ class PersistentProcPool:
             self._dispatch_pending_jobs()
             next_worker_check = monotonic() + _MANAGER_INTERVAL
             try:
-                pending_message = self._receive_completion(max(0.0, next_worker_check - monotonic()))
+                pending_message = self._receive_completion(
+                    max(0.0, next_worker_check - monotonic())
+                )
             except (OSError, ValueError):
                 pending_message = None
         self._close_completion_channels()
