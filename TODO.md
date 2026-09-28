@@ -42,6 +42,15 @@
   `memory.max`). Add deterministic retained-RSS tests and preserve cached-worker
   efficiency for measured-light jobs, complete callbacks, cleanup, and the rule
   that admission never rejects an individually valid job.
-- [ ] Publish the OOM-loss, nonblocking/fair-admission, and per-job retirement
+- [x] Publish the OOM-loss, nonblocking/fair-admission, and per-job retirement
   work as an immutable revision for ALES to pin and validate against the
   425-child large-JAR lifecycle and retained-RSS heavy-job sequence.
+- [x] Fix the manager-thread process-exit race observed in the 2026-09-28 ALES
+  RAR corpus replay. A worker can exit and be reaped after
+  `PersistentProcPool._thrd_mgr` observes it as live but before
+  `psutil.Process.status()` reads `/proc/<pid>/stat`. The resulting
+  `psutil.NoSuchProcess` currently escapes from the manager thread and leaves
+  the ALES caller waiting until its outer wall timeout. Treat that expected
+  process-exit race as a worker-exit outcome, preserve exactly-once
+  completion/callback delivery, and add a deterministic regression that exits
+  and reaps a worker between liveness and status/accounting inspection.

@@ -234,6 +234,21 @@ def test_proc_pool_callback_runs() -> None:
     assert callbacks
 
 
+def test_proc_status_treats_disappearance_as_dead(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proc = ProcPool.Proc(_consume, [])
+
+    class VanishedProcess:
+        @staticmethod
+        def status() -> str:
+            raise pool_module.psutil.NoSuchProcess(12345)
+
+    monkeypatch.setattr(proc, "get_psproc", lambda: VanishedProcess())
+
+    assert proc.status() == "dead"
+
+
 @pytest.mark.parametrize(
     "pool_type",
     [ProcPool, PersistentProcPool],
@@ -801,6 +816,80 @@ def test_persistent_pool_reports_abnormal_exit_and_recovers(
             )
             assert recovered.wait(5)
             assert output.read_text(encoding="utf-8") == "ok"
+
+
+def test_persistent_pool_handles_worker_exit_during_accounting_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(pool_module, "_MANAGER_INTERVAL", 0.01)
+    real_contained_rss = pool_module.contained_rss
+    events: list[str] = []
+    errors: list[str] = []
+    exitcodes: list[int | None] = []
+    completed = Event()
+    recovered = Event()
+    pool_ref: list[PersistentProcPool] = []
+    forced_exit = False
+
+    def exit_and_reap_before_accounting(pid: int, backend: str) -> int:
+        nonlocal forced_exit
+        if forced_exit:
+            return real_contained_rss(pid, backend)
+        forced_exit = True
+        worker = pool_ref[0]._workers[0]
+        assert worker.pid == pid
+        assert worker.is_alive()
+        worker.kill()
+        worker.join(timeout=5)
+        assert not worker.is_alive()
+        exitcodes.append(worker.exitcode)
+        raise pool_module.psutil.NoSuchProcess(pid)
+
+    monkeypatch.setattr(
+        pool_module,
+        "contained_rss",
+        exit_and_reap_before_accounting,
+    )
+    with PersistentProcPool(
+        1,
+        on_job_error=lambda _args, error: (
+            errors.append(error),
+            events.append("error"),
+        ),
+    ) as pool:
+        pool_ref.append(pool)
+        initial_pid = pool._workers[0].pid
+        handle = pool.submit(
+            sleep,
+            [30],
+            reserve_mem=1,
+            callback=lambda _args: (events.append("callback"), completed.set()),
+        )
+
+        assert completed.wait(5)
+        assert handle.wait(0.1)
+        assert not handle.successful()
+        assert len(exitcodes) == 1
+        expected_error = pool_module._worker_exit_error(
+            exitcodes[0],
+            shutting_down=False,
+        )
+        assert handle.error == expected_error
+        assert errors == [expected_error]
+        assert events == ["error", "callback"]
+        assert pool._mg_thrd.is_alive()
+        assert pool._workers[0].pid != initial_pid
+
+        recovery = pool.submit(
+            _consume,
+            [],
+            callback=lambda _args: recovered.set(),
+        )
+        assert recovered.wait(5)
+        assert recovery.wait(0.1)
+        assert recovery.successful()
+
+    assert events == ["error", "callback"]
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX signal exit codes only")

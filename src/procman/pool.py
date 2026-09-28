@@ -370,7 +370,12 @@ class ProcPool:
         def status(self) -> str:
             psproc = self.get_psproc()
             if psproc:
-                return psproc.status()
+                try:
+                    return psproc.status()
+                except (psutil.NoSuchProcess, ProcessLookupError):
+                    # The process can disappear after get_psproc() verifies
+                    # its identity but before psutil reads its status.
+                    return "dead"
             return "dead"
 
         def get_callback(self) -> JobCallback | None:
@@ -1147,6 +1152,40 @@ class PersistentProcPool:
             self._set_worker_idle(worker_id)
         return cleanup_error
 
+    def _handle_worker_exit(
+        self,
+        worker_id: int,
+        job_id: int | None,
+        proc: Any,
+    ) -> None:
+        """Replace an exited worker and publish its job outcome once."""
+
+        proc.join(timeout=0)
+        exitcode = proc.exitcode
+        job = None
+        backend = None
+        if job_id is not None:
+            job = self._pop_running_job(job_id)
+            backend = job.get("backend") if job else None
+        replace_job_queue = bool(job and job.get("start") is None)
+        self._restart_worker(
+            worker_id,
+            backend=backend,
+            replace_job_queue=replace_job_queue,
+        )
+        if job is None:
+            return
+        error = _worker_exit_error(
+            exitcode,
+            shutting_down=not self.running,
+        )
+        print(f"PersistentProcPool worker {worker_id} job {job_id} failed: {error}")
+        self._complete_job(
+            job,
+            error=error,
+            report_error=True,
+        )
+
     def _thrd_mgr(self) -> None:
         pending_message = None
         next_worker_check = monotonic()
@@ -1233,33 +1272,7 @@ class PersistentProcPool:
                 if proc is None:
                     continue
                 if not proc.is_alive():
-                    proc.join(timeout=0)
-                    exitcode = proc.exitcode
-                    job = None
-                    backend = None
-                    if job_id is not None:
-                        job = self._pop_running_job(job_id)
-                        backend = job.get("backend") if job else None
-                    replace_job_queue = bool(job and job.get("start") is None)
-                    self._restart_worker(
-                        worker_id,
-                        backend=backend,
-                        replace_job_queue=replace_job_queue,
-                    )
-                    if job:
-                        error = _worker_exit_error(
-                            exitcode,
-                            shutting_down=not self.running,
-                        )
-                        print(
-                            f"PersistentProcPool worker {worker_id} job "
-                            f"{job_id} failed: {error}"
-                        )
-                        self._complete_job(
-                            job,
-                            error=error,
-                            report_error=True,
-                        )
+                    self._handle_worker_exit(worker_id, job_id, proc)
                     continue
                 if job_id is None:
                     continue
@@ -1304,16 +1317,31 @@ class PersistentProcPool:
                 if job["limit_mem"] or job["reserve_mem"]:
                     if proc.pid is None:
                         continue
+                    accounting_error: ContainmentError | None = None
                     try:
                         rss = contained_rss(proc.pid, job["backend"])
                         job["rss"] = rss
                         mem_mb = rss / _MEBIBYTE
                     except ContainmentError as error:
+                        accounting_error = error
+                    except (psutil.NoSuchProcess, ProcessLookupError) as error:
+                        # A worker can exit after the liveness probe above but
+                        # before psutil inspects its containment unit. Re-probe
+                        # through multiprocessing so its exit code is captured
+                        # and route it through the normal worker-exit outcome.
+                        if not proc.is_alive():
+                            self._handle_worker_exit(worker_id, job_id, proc)
+                            continue
+                        accounting_error = ContainmentError(
+                            f"process disappeared during containment accounting: "
+                            f"{error}"
+                        )
+                    if accounting_error is not None:
                         if finishing_event is not None and finishing_event.is_set():
                             continue
                         print(
                             f"PersistentProcPool worker {worker_id} job {job_id} "
-                            f"containment accounting failed: {error}"
+                            f"containment accounting failed: {accounting_error}"
                         )
                         job = self._pop_running_job(job_id)
                         if job is None:
@@ -1330,7 +1358,8 @@ class PersistentProcPool:
                         if cleanup_error is not None:
                             details["cleanup_error"] = cleanup_error
                         diagnostic = JobDiagnostic(
-                            f"Process containment accounting unavailable: {error}",
+                            f"Process containment accounting unavailable: "
+                            f"{accounting_error}",
                             code=_ACCOUNTING_UNAVAILABLE,
                             details=details,
                         )
